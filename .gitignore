@@ -1,0 +1,12 @@
+# Сборка
+target/
+# IDE
+.idea/
+.vscode/
+*.iml
+# Секреты и локальные настройки
+.env
+keys/
+# ОС
+.DS_Store
+Thumbs.db
