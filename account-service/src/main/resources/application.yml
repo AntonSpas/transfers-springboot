@@ -8,13 +8,27 @@ spring:
     virtual:
       enabled: true
   datasource:
-    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/account_db}
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5433/account_db}
     username: ${SPRING_DATASOURCE_USERNAME:account_svc}
     password: ${SPRING_DATASOURCE_PASSWORD:account_dev_password}
+    hikari:
+      # Пул создаёт Spring Boot (HikariCP) и без этого блока; здесь размер задан явно (10 — значение по умолчанию).
+      # Три сервиса по 10 соединений укладываются в max_connections = 100 у Postgres.
+      maximum-pool-size: 10
+      # Postgres обрывает ожидание блокировки строки (SELECT ... FOR UPDATE) через 5 секунд;
+      # клиент получает 503 + Retry-After (см. GlobalExceptionHandler) вместо бесконечного ожидания.
+      connection-init-sql: "SET lock_timeout = '5s'"
   jpa:
     open-in-view: false
     hibernate:
       ddl-auto: validate
+
+app:
+  internal:
+    # Общий секрет сервисов для /internal/** (заголовок X-Internal-Token).
+    # Значение по умолчанию — только для локальной разработки; настоящее задаётся в .env, не коммитится.
+    # Пустое значение останавливает старт приложения.
+    api-token: ${INTERNAL_API_TOKEN:internal_dev_token}
 
 management:
   endpoints:
@@ -25,4 +39,3 @@ management:
     health:
       probes:
         enabled: true
-

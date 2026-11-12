@@ -8,7 +8,7 @@ spring:
     virtual:
       enabled: true
   datasource:
-    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/transfer_db}
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5433/transfer_db}
     username: ${SPRING_DATASOURCE_USERNAME:transfer_svc}
     password: ${SPRING_DATASOURCE_PASSWORD:transfer_dev_password}
   kafka:

@@ -1,0 +1,23 @@
+package io.moneyflow.account.support;
+
+import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+import org.springframework.context.annotation.Bean;
+import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.utility.DockerImageName;
+
+/**
+ * Один контейнер Postgres на весь прогон тестов: контейнер живёт как бин контекста,
+ * а контекст Spring кэшируется между тестовыми классами с одинаковой конфигурацией.
+ * (Статический @Container в базовом классе перезапускался бы для каждого класса,
+ * а кэшированный контекст продолжал бы смотреть на уже остановленный контейнер.)
+ */
+@TestConfiguration(proxyBeanMethods = false)
+public class PostgresTestConfig {
+
+    @Bean
+    @ServiceConnection
+    PostgreSQLContainer<?> postgres() {
+        return new PostgreSQLContainer<>(DockerImageName.parse("postgres:17"));
+    }
+}

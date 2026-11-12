@@ -32,7 +32,7 @@ services:
       - pgdata:/var/lib/postgresql/data
       # выполняется только при первом старте на пустом томе
       - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
-    ports: ["5432:5432"]
+    ports: ["5433:5432"]
     mem_limit: 384m
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
@@ -86,6 +86,7 @@ services:
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/account_db
       SPRING_DATASOURCE_USERNAME: account_svc
       SPRING_DATASOURCE_PASSWORD: ${ACCOUNT_DB_PASSWORD:-account_dev_password}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-internal_dev_token}
       # JWT-ключи добавим на шаге аутентификации:
       #   JWT_PRIVATE_KEY_LOCATION: file:/keys/private.pem
       #   JWT_PUBLIC_KEY_LOCATION: file:/keys/public.pem

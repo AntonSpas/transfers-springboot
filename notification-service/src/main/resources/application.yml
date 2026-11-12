@@ -8,7 +8,7 @@ spring:
     virtual:
       enabled: true
   datasource:
-    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/notification_db}
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5433/notification_db}
     username: ${SPRING_DATASOURCE_USERNAME:notification_svc}
     password: ${SPRING_DATASOURCE_PASSWORD:notification_dev_password}
   kafka:
