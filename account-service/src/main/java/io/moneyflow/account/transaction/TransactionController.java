@@ -1,7 +1,10 @@
 package io.moneyflow.account.transaction;
 
+import io.moneyflow.account.auth.CurrentUser;
 import io.moneyflow.account.common.PageResponse;
 import org.springframework.data.domain.PageRequest;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -26,12 +29,15 @@ public class TransactionController {
      * Pageable намеренно не принимаем напрямую: через него клиент мог бы передать sort,
      * который наложился бы на фиксированный порядок «новые сверху». Параметры page и size
      * приводятся к допустимым границам, а не отклоняются: page >= 0, 1 <= size <= 100.
+     * История доступна только владельцу счёта (пользователь берётся из токена).
      */
     @GetMapping
-    public PageResponse<TransactionResponse> history(@PathVariable UUID accountId,
+    public PageResponse<TransactionResponse> history(@AuthenticationPrincipal Jwt jwt,
+                                                     @PathVariable UUID accountId,
                                                      @RequestParam(defaultValue = "0") int page,
                                                      @RequestParam(defaultValue = "20") int size) {
         PageRequest pageRequest = PageRequest.of(Math.max(page, 0), Math.min(Math.max(size, 1), MAX_PAGE_SIZE));
-        return PageResponse.from(service.getHistory(accountId, pageRequest), TransactionResponse::from);
+        return PageResponse.from(
+                service.getHistory(accountId, CurrentUser.id(jwt), pageRequest), TransactionResponse::from);
     }
 }

@@ -11,6 +11,7 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.springframework.http.HttpHeaders.AUTHORIZATION;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
@@ -19,6 +20,7 @@ class DepositIdempotencyTest extends IntegrationTestBase {
 
     private ResultActions deposit(UUID accountId, String amount, String key) throws Exception {
         return mockMvc.perform(post("/accounts/{id}/deposits", accountId)
+                .header(AUTHORIZATION, ownerBearer(accountId))
                 .header("Idempotency-Key", key)
                 .contentType(MediaType.APPLICATION_JSON)
                 .content("{\"amount\": " + amount + "}"));
@@ -103,6 +105,7 @@ class DepositIdempotencyTest extends IntegrationTestBase {
         UUID id = newAccount("RUB", "0");
 
         mockMvc.perform(post("/accounts/{id}/deposits", id)
+                        .header(AUTHORIZATION, ownerBearer(id))
                         .contentType(MediaType.APPLICATION_JSON).content("{\"amount\": 10}"))
                 .andExpect(status().isBadRequest());
 
@@ -124,6 +127,7 @@ class DepositIdempotencyTest extends IntegrationTestBase {
 
     @Test
     void unknownAccount_withKey_returns404() throws Exception {
+        // ownerBearer для несуществующего счёта выдаёт токен случайного пользователя
         deposit(UUID.randomUUID(), "10", UUID.randomUUID().toString())
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.code").value("ACCOUNT_NOT_FOUND"));

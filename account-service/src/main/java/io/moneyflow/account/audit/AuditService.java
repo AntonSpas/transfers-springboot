@@ -19,8 +19,9 @@ public class AuditService {
     /**
      * MANDATORY: запись аудита обязана идти в одной транзакции с самой операцией,
      * чтобы не получить действие без записи в журнале или запись о несостоявшемся действии.
+     * Поэтому любой метод, который пишет аудит, должен быть @Transactional.
      *
-     * @param actorId null означает системное действие (пока нет аутентификации, всегда null)
+     * @param actorId id пользователя из токена (sub); null означает системное действие без пользователя
      */
     @Transactional(propagation = Propagation.MANDATORY)
     public void record(UUID actorId, String action, String entityType, UUID entityId, Map<String, Object> details) {

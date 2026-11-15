@@ -14,6 +14,7 @@ import java.util.Set;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.springframework.http.HttpHeaders.AUTHORIZATION;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -23,6 +24,7 @@ class DepositAndHistoryTest extends IntegrationTestBase {
 
     private int deposit(UUID accountId, String amount) throws Exception {
         return mockMvc.perform(post("/accounts/{id}/deposits", accountId)
+                        .header(AUTHORIZATION, ownerBearer(accountId))
                         .header("Idempotency-Key", UUID.randomUUID().toString())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"amount\": " + amount + "}"))
@@ -34,8 +36,10 @@ class DepositAndHistoryTest extends IntegrationTestBase {
     @Test
     void deposit_increasesBalance_andReturnsTransaction() throws Exception {
         UUID id = newAccount("RUB", "0");
+        String auth = ownerBearer(id);
 
         JsonNode first = body(mockMvc.perform(post("/accounts/{id}/deposits", id)
+                        .header(AUTHORIZATION, auth)
                         .header("Idempotency-Key", UUID.randomUUID().toString())
                         .contentType(MediaType.APPLICATION_JSON).content("{\"amount\": 100.50}"))
                 .andExpect(status().isCreated())
@@ -46,6 +50,7 @@ class DepositAndHistoryTest extends IntegrationTestBase {
         assertThat(decimal(first.get("balanceAfter"))).isEqualByComparingTo("100.50");
 
         JsonNode second = body(mockMvc.perform(post("/accounts/{id}/deposits", id)
+                        .header(AUTHORIZATION, auth)
                         .header("Idempotency-Key", UUID.randomUUID().toString())
                         .contentType(MediaType.APPLICATION_JSON).content("{\"amount\": 50}"))
                 .andExpect(status().isCreated()));
@@ -81,6 +86,7 @@ class DepositAndHistoryTest extends IntegrationTestBase {
         UUID id = newAccount("RUB", "5");
 
         mockMvc.perform(post("/accounts/{id}/deposits", id)
+                        .header(AUTHORIZATION, ownerBearer(id))
                         .header("Idempotency-Key", UUID.randomUUID().toString())
                         .contentType(MediaType.APPLICATION_JSON).content(requestBody))
                 .andExpect(status().isBadRequest());
@@ -92,6 +98,7 @@ class DepositAndHistoryTest extends IntegrationTestBase {
     @Test
     void deposit_unknownAccount_returns404() throws Exception {
         mockMvc.perform(post("/accounts/{id}/deposits", UUID.randomUUID())
+                        .header(AUTHORIZATION, bearer(newUser()))
                         .header("Idempotency-Key", UUID.randomUUID().toString())
                         .contentType(MediaType.APPLICATION_JSON).content("{\"amount\": 1}"))
                 .andExpect(status().isNotFound())
@@ -110,7 +117,8 @@ class DepositAndHistoryTest extends IntegrationTestBase {
 
         // Под блокировкой каждое пополнение видит результат предыдущего:
         // balance_after по проводкам — ровно 10, 20, ..., 300 без пропусков и повторов.
-        JsonNode page = body(mockMvc.perform(get("/accounts/{id}/transactions", id).param("size", "100"))
+        JsonNode page = body(mockMvc.perform(get("/accounts/{id}/transactions", id)
+                        .header(AUTHORIZATION, ownerBearer(id)).param("size", "100"))
                 .andExpect(status().isOk()));
         assertThat(page.get("totalElements").asInt()).isEqualTo(n);
         Set<BigDecimal> seen = new HashSet<>();
@@ -127,11 +135,13 @@ class DepositAndHistoryTest extends IntegrationTestBase {
     @Test
     void history_newestFirst_andPaginated() throws Exception {
         UUID id = newAccount("RUB", "0");
+        String auth = ownerBearer(id);
         for (int amount = 1; amount <= 5; amount++) {
             assertThat(deposit(id, String.valueOf(amount))).isEqualTo(201);
         }
 
         JsonNode page0 = body(mockMvc.perform(get("/accounts/{id}/transactions", id)
+                        .header(AUTHORIZATION, auth)
                         .param("page", "0").param("size", "2"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.page").value(0))
@@ -141,10 +151,12 @@ class DepositAndHistoryTest extends IntegrationTestBase {
         assertThat(amounts(page0)).containsExactly("5", "4");
 
         JsonNode page1 = body(mockMvc.perform(get("/accounts/{id}/transactions", id)
+                .header(AUTHORIZATION, auth)
                 .param("page", "1").param("size", "2")));
         assertThat(amounts(page1)).containsExactly("3", "2");
 
         JsonNode page2 = body(mockMvc.perform(get("/accounts/{id}/transactions", id)
+                .header(AUTHORIZATION, auth)
                 .param("page", "2").param("size", "2")));
         assertThat(amounts(page2)).containsExactly("1");
     }
@@ -153,7 +165,7 @@ class DepositAndHistoryTest extends IntegrationTestBase {
     void history_emptyForNewAccount() throws Exception {
         UUID id = newAccount("RUB", "0");
 
-        mockMvc.perform(get("/accounts/{id}/transactions", id))
+        mockMvc.perform(get("/accounts/{id}/transactions", id).header(AUTHORIZATION, ownerBearer(id)))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.content").isEmpty())
                 .andExpect(jsonPath("$.totalElements").value(0));
@@ -162,12 +174,13 @@ class DepositAndHistoryTest extends IntegrationTestBase {
     @Test
     void history_paramsAreClampedToLimits() throws Exception {
         UUID id = newAccount("RUB", "1");
+        String auth = ownerBearer(id);
 
-        mockMvc.perform(get("/accounts/{id}/transactions", id).param("size", "1000"))
+        mockMvc.perform(get("/accounts/{id}/transactions", id).header(AUTHORIZATION, auth).param("size", "1000"))
                 .andExpect(status().isOk()).andExpect(jsonPath("$.size").value(100));
-        mockMvc.perform(get("/accounts/{id}/transactions", id).param("size", "0"))
+        mockMvc.perform(get("/accounts/{id}/transactions", id).header(AUTHORIZATION, auth).param("size", "0"))
                 .andExpect(status().isOk()).andExpect(jsonPath("$.size").value(1));
-        mockMvc.perform(get("/accounts/{id}/transactions", id).param("page", "-3"))
+        mockMvc.perform(get("/accounts/{id}/transactions", id).header(AUTHORIZATION, auth).param("page", "-3"))
                 .andExpect(status().isOk()).andExpect(jsonPath("$.page").value(0));
     }
 
@@ -177,14 +190,15 @@ class DepositAndHistoryTest extends IntegrationTestBase {
         deposit(id, "1");
         deposit(id, "2");
 
-        JsonNode page = body(mockMvc.perform(get("/accounts/{id}/transactions", id).param("sort", "amount,asc"))
+        JsonNode page = body(mockMvc.perform(get("/accounts/{id}/transactions", id)
+                        .header(AUTHORIZATION, ownerBearer(id)).param("sort", "amount,asc"))
                 .andExpect(status().isOk()));
         assertThat(amounts(page)).containsExactly("2", "1");
     }
 
     @Test
     void history_unknownAccount_returns404() throws Exception {
-        mockMvc.perform(get("/accounts/{id}/transactions", UUID.randomUUID()))
+        mockMvc.perform(get("/accounts/{id}/transactions", UUID.randomUUID()).header(AUTHORIZATION, bearer(newUser())))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.code").value("ACCOUNT_NOT_FOUND"));
     }

@@ -7,6 +7,10 @@ spring:
   threads:
     virtual:
       enabled: true
+  config:
+    import:
+      - optional:file:.env[.properties]
+      - optional:file:../.env[.properties]
   datasource:
     url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5433/account_db}
     username: ${SPRING_DATASOURCE_USERNAME:account_svc}
@@ -29,7 +33,10 @@ app:
     # Значение по умолчанию — только для локальной разработки; настоящее задаётся в .env, не коммитится.
     # Пустое значение останавливает старт приложения.
     api-token: ${INTERNAL_API_TOKEN:internal_dev_token}
-
+  jwt:
+    private-key-path: ${JWT_PRIVATE_KEY_PATH:}
+    public-key-path: ${JWT_PUBLIC_KEY_PATH:}
+    access-token-ttl: 15m
 management:
   endpoints:
     web:

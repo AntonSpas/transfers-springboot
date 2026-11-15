@@ -13,6 +13,7 @@ import java.util.Map;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.springframework.http.HttpHeaders.AUTHORIZATION;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -36,12 +37,14 @@ class LockTimeoutTest extends IntegrationTestBase {
     void depositOnLockedAccount_returns503_thenSucceedsOnRetryWithSameKey() throws Exception {
         UUID id = newAccount("RUB", "10");
         String key = UUID.randomUUID().toString();
+        String auth = ownerBearer(id); // токен выпускаем до того, как возьмём блокировку
 
         try (Connection holder = dataSource.getConnection()) {
             holder.setAutoCommit(false);
             lockAccount(holder, id);
 
             mockMvc.perform(post("/accounts/{id}/deposits", id)
+                            .header(AUTHORIZATION, auth)
                             .header("Idempotency-Key", key)
                             .contentType(MediaType.APPLICATION_JSON).content("{\"amount\": 5}"))
                     .andExpect(status().isServiceUnavailable())
@@ -54,6 +57,7 @@ class LockTimeoutTest extends IntegrationTestBase {
         // Неудавшаяся попытка ничего не сохранила, поэтому тот же ключ пригоден для повтора.
         assertThat(balanceOf(id)).isEqualByComparingTo("10");
         mockMvc.perform(post("/accounts/{id}/deposits", id)
+                        .header(AUTHORIZATION, auth)
                         .header("Idempotency-Key", key)
                         .contentType(MediaType.APPLICATION_JSON).content("{\"amount\": 5}"))
                 .andExpect(status().isCreated());
@@ -67,6 +71,7 @@ class LockTimeoutTest extends IntegrationTestBase {
         UUID transferId = UUID.randomUUID();
         String json = objectMapper.writeValueAsString(Map.of(
                 "transferId", transferId.toString(),
+                "initiatorId", ownerOf(from).toString(),
                 "fromAccountId", from.toString(),
                 "toAccountId", to.toString(),
                 "amount", 3,

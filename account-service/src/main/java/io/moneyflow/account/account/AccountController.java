@@ -1,9 +1,12 @@
 package io.moneyflow.account.account;
 
+import io.moneyflow.account.auth.CurrentUser;
 import io.moneyflow.account.transaction.TransactionResponse;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -26,22 +29,24 @@ public class AccountController {
         this.service = service;
     }
 
+    /** Владелец нового счёта — пользователь из токена. */
     @PostMapping
-    public ResponseEntity<AccountResponse> create(@Valid @RequestBody CreateAccountRequest request) {
-        Account account = service.createAccount(request.ownerId(), request.currency());
+    public ResponseEntity<AccountResponse> create(@AuthenticationPrincipal Jwt jwt,
+                                                  @Valid @RequestBody CreateAccountRequest request) {
+        Account account = service.createAccount(CurrentUser.id(jwt), request.currency());
         URI location = ServletUriComponentsBuilder.fromCurrentRequest()
                 .path("/{id}").buildAndExpand(account.getId()).toUri();
         return ResponseEntity.created(location).body(AccountResponse.from(account));
     }
 
     @GetMapping("/{id}")
-    public AccountResponse get(@PathVariable UUID id) {
-        return AccountResponse.from(service.getAccount(id));
+    public AccountResponse get(@AuthenticationPrincipal Jwt jwt, @PathVariable UUID id) {
+        return AccountResponse.from(service.getOwnedAccount(id, CurrentUser.id(jwt)));
     }
 
     @GetMapping("/{id}/balance")
-    public BalanceResponse balance(@PathVariable UUID id) {
-        return BalanceResponse.from(service.getAccount(id));
+    public BalanceResponse balance(@AuthenticationPrincipal Jwt jwt, @PathVariable UUID id) {
+        return BalanceResponse.from(service.getOwnedAccount(id, CurrentUser.id(jwt)));
     }
 
     /**
@@ -49,10 +54,11 @@ public class AccountController {
      * не пополнит счёт второй раз. 201 — пополнение выполнено сейчас, 200 — повтор, возвращена сохранённая проводка.
      */
     @PostMapping("/{id}/deposits")
-    public ResponseEntity<TransactionResponse> deposit(@PathVariable UUID id,
+    public ResponseEntity<TransactionResponse> deposit(@AuthenticationPrincipal Jwt jwt,
+                                                       @PathVariable UUID id,
                                                        @RequestHeader("Idempotency-Key") String idempotencyKey,
                                                        @Valid @RequestBody DepositRequest request) {
-        DepositResult result = service.deposit(id, request.amount(), idempotencyKey);
+        DepositResult result = service.depositByUser(id, CurrentUser.id(jwt), request.amount(), idempotencyKey);
         HttpStatus status = result.replayed() ? HttpStatus.OK : HttpStatus.CREATED;
         return ResponseEntity.status(status).body(TransactionResponse.from(result.transaction()));
     }

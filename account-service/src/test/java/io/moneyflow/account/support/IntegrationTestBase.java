@@ -13,10 +13,17 @@ import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMock
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.annotation.Import;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.security.oauth2.jose.jws.SignatureAlgorithm;
+import org.springframework.security.oauth2.jwt.JwsHeader;
+import org.springframework.security.oauth2.jwt.JwtClaimsSet;
+import org.springframework.security.oauth2.jwt.JwtEncoder;
+import org.springframework.security.oauth2.jwt.JwtEncoderParameters;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
 
 import java.math.BigDecimal;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -29,16 +36,23 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.IntFunction;
 
 /**
- * Общая основа интеграционных тестов: реальный Postgres (Testcontainers), миграции Flyway, полный контекст.
+ * Общая основа интеграционных тестов: реальный Postgres (Testcontainers), миграции Flyway, полный контекст,
+ * RSA-ключи JWT в памяти.
  *
  * <p>Таблицы между тестами не очищаются: проводки и аудит неизменяемы (триггеры запрещают DELETE),
  * поэтому каждый тест создаёт собственных пользователя и счета с уникальными id
  * и проверяет только свои данные.
+ *
+ * <p>Любой интеграционный тест должен наследоваться от этого класса (в том числе AccountServiceApplicationTests):
+ * одинаковая конфигурация контекста даёт его кэширование и один контейнер Postgres на прогон.
  */
 @SpringBootTest
 @AutoConfigureMockMvc
-@Import(PostgresTestConfig.class)
+@Import({PostgresTestConfig.class, JwtTestConfig.class})
 public abstract class IntegrationTestBase {
+
+    /** Заведомо больше допуска рассинхрона часов декодера (по умолчанию 60 секунд). */
+    private static final Duration EXPIRED_AGO = Duration.ofMinutes(10);
 
     @Autowired
     protected MockMvc mockMvc;
@@ -52,6 +66,8 @@ public abstract class IntegrationTestBase {
     protected AccountRepository accounts;
     @Autowired
     protected AccountService accountService;
+    @Autowired
+    protected JwtEncoder jwtEncoder;
 
     /** Общий секрет для вызовов /internal/** (заголовок X-Internal-Token). */
     @Value("${app.internal.api-token}")
@@ -78,6 +94,51 @@ public abstract class IntegrationTestBase {
     protected BigDecimal balanceOf(UUID accountId) {
         return accounts.findById(accountId).orElseThrow().getBalance();
     }
+
+    /**
+     * Владелец счёта. Для несуществующего счёта владельца нет, и возвращается случайный id:
+     * такой «пользователь» ничем не владеет, поэтому тесты «счёт не найден» не требуют отдельной ветки.
+     */
+    protected UUID ownerOf(UUID accountId) {
+        List<UUID> owners = jdbc.queryForList("select owner_id from accounts where id = ?", UUID.class, accountId);
+        return owners.isEmpty() ? UUID.randomUUID() : owners.get(0);
+    }
+
+    // ---- JWT ----------------------------------------------------------------------------------------------------
+
+    /** Значение заголовка Authorization с валидным токеном (RS256, 15 минут, роль USER). */
+    protected String bearer(UUID userId) {
+        return bearer(userId, List.of("USER"));
+    }
+
+    protected String bearer(UUID userId, List<String> roles) {
+        Instant now = Instant.now();
+        return "Bearer " + signToken(userId, roles, now, now.plus(Duration.ofMinutes(15)));
+    }
+
+    /** Токен с верной подписью, но истёкший (с запасом больше допуска рассинхрона часов). */
+    protected String expiredBearer(UUID userId) {
+        Instant expiredAt = Instant.now().minus(EXPIRED_AGO);
+        return "Bearer " + signToken(userId, List.of("USER"), expiredAt.minus(Duration.ofMinutes(15)), expiredAt);
+    }
+
+    /** Токен владельца счёта (для несуществующего счёта — токен случайного пользователя, см. {@link #ownerOf}). */
+    protected String ownerBearer(UUID accountId) {
+        return bearer(ownerOf(accountId));
+    }
+
+    private String signToken(UUID userId, List<String> roles, Instant issuedAt, Instant expiresAt) {
+        JwtClaimsSet claims = JwtClaimsSet.builder()
+                .subject(userId.toString())
+                .issuedAt(issuedAt)
+                .expiresAt(expiresAt)
+                .claim("roles", roles)
+                .build();
+        JwsHeader header = JwsHeader.with(SignatureAlgorithm.RS256).build();
+        return jwtEncoder.encode(JwtEncoderParameters.from(header, claims)).getTokenValue();
+    }
+
+    // ---- общие хелперы --------------------------------------------------------------------------------------------
 
     protected JsonNode body(ResultActions result) throws Exception {
         return objectMapper.readTree(result.andReturn().getResponse().getContentAsString());

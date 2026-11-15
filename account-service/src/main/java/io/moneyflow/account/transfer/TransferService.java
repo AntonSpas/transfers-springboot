@@ -1,6 +1,7 @@
 package io.moneyflow.account.transfer;
 
 import io.moneyflow.account.account.Account;
+import io.moneyflow.account.account.AccountAccessDeniedException;
 import io.moneyflow.account.account.AccountNotFoundException;
 import io.moneyflow.account.account.AccountRepository;
 import io.moneyflow.account.audit.AuditActions;
@@ -40,6 +41,10 @@ public class TransferService {
      * <p>Порядок действий важен:
      * <ol>
      *   <li>Оба счёта блокируются одним запросом в порядке id (защита от deadlock встречных переводов).</li>
+     *   <li>Счёт-источник должен существовать (404) и принадлежать {@code initiatorId} (403, решение №17).
+     *       Владелец проверяется под блокировкой и раньше всего остального: посторонний не узнаёт ни про
+     *       счёт-получатель, ни про валюты, ни про то, выполнялся ли такой transferId.</li>
+     *   <li>Счёт-получатель должен существовать (404); зачислять можно на счёт любого пользователя.</li>
      *   <li>Проверка «этот transferId уже выполнен» делается <b>после</b> блокировки. Если два одинаковых
      *       вызова придут одновременно, второй дождётся первого и увидит его проводки, а не упрётся
      *       в UNIQUE (transfer_id, type) с ошибкой 500.</li>
@@ -47,10 +52,11 @@ public class TransferService {
      *       Если параметры повтора отличаются, это 409.</li>
      *   <li>Баланс проверяется уже под блокировкой, поэтому результат проверки не устареет до списания.</li>
      * </ol>
+     * В аудит пишется {@code initiatorId}; владельцы обоих счетов возвращаются для notification-service.
      */
     @Transactional
-    public TransferResult transfer(UUID transferId, UUID fromAccountId, UUID toAccountId,
-                                   BigDecimal amount, String currency) {
+    public TransferOutcome transfer(UUID transferId, UUID initiatorId, UUID fromAccountId, UUID toAccountId,
+                                    BigDecimal amount, String currency) {
         if (fromAccountId.equals(toAccountId)) {
             throw new SameAccountTransferException();
         }
@@ -59,6 +65,9 @@ public class TransferService {
         Map<UUID, Account> locked = accounts.findAllByIdForUpdate(List.of(fromAccountId, toAccountId)).stream()
                 .collect(Collectors.toMap(Account::getId, Function.identity()));
         Account from = requireAccount(locked, fromAccountId);
+        if (!from.getOwnerId().equals(initiatorId)) {
+            throw new AccountAccessDeniedException();
+        }
         Account to = requireAccount(locked, toAccountId);
 
         // Валюта счёта неизменна, поэтому эти проверки безопасны и для повторного вызова.
@@ -73,7 +82,8 @@ public class TransferService {
 
         List<AccountTransaction> existing = transactions.findByTransferId(transferId);
         if (!existing.isEmpty()) {
-            return replay(existing, transferId, fromAccountId, toAccountId, normalized);
+            TransferResult replayed = replay(existing, transferId, fromAccountId, toAccountId, normalized);
+            return new TransferOutcome(replayed, from.getOwnerId(), to.getOwnerId());
         }
 
         if (from.getBalance().compareTo(normalized) < 0) {
@@ -87,12 +97,12 @@ public class TransferService {
         AccountTransaction credit = transactions.save(
                 AccountTransaction.transferCredit(to.getId(), normalized, to.getBalance(), transferId));
 
-        audit.record(null, AuditActions.TRANSFER, "TRANSFER", transferId,
+        audit.record(initiatorId, AuditActions.TRANSFER, "TRANSFER", transferId,
                 Map.of("fromAccountId", fromAccountId.toString(),
                         "toAccountId", toAccountId.toString(),
                         "amount", normalized.toPlainString(),
                         "currency", currency));
-        return new TransferResult(debit, credit, false);
+        return new TransferOutcome(new TransferResult(debit, credit, false), from.getOwnerId(), to.getOwnerId());
     }
 
     private static Account requireAccount(Map<UUID, Account> locked, UUID id) {
