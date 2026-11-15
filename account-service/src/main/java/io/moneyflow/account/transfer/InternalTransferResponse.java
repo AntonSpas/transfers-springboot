@@ -9,17 +9,22 @@ public record InternalTransferResponse(
         UUID transferId,
         UUID fromAccountId,
         UUID toAccountId,
+        UUID fromOwnerId,
+        UUID toOwnerId,
         BigDecimal amount,
         String currency,
         TransactionResponse debit,
         TransactionResponse credit
 ) {
 
-    public static InternalTransferResponse from(TransferResult result, String currency) {
+    public static InternalTransferResponse from(TransferOutcome outcome, String currency) {
+        TransferResult result = outcome.result();
         return new InternalTransferResponse(
                 result.debit().getTransferId(),
                 result.debit().getAccountId(),
                 result.credit().getAccountId(),
+                outcome.fromOwnerId(),
+                outcome.toOwnerId(),
                 result.debit().getAmount(),
                 currency,
                 TransactionResponse.from(result.debit()),

@@ -37,6 +37,7 @@ public class AccountService {
     }
 
     /**
+     * Создаёт счёт для пользователя {@code ownerId}; он же записывается в аудит как автор действия.
      * Ограничения «один счёт на валюту» нет (см. схему), поэтому у владельца может быть несколько счетов одной валюты.
      * Проверки владельца и валюты дают понятную ошибку вместо нарушения внешнего ключа на уровне БД.
      */
@@ -49,29 +50,66 @@ public class AccountService {
             throw new UnsupportedCurrencyException(currency);
         }
         Account account = accounts.save(new Account(ownerId, currency));
-        audit.record(null, AuditActions.CREATE_ACCOUNT, "ACCOUNT", account.getId(),
+        audit.record(ownerId, AuditActions.CREATE_ACCOUNT, "ACCOUNT", account.getId(),
                 Map.of("ownerId", ownerId.toString(), "currency", currency));
         return account;
     }
 
+    /**
+     * Счёт без проверки владельца: только для внутренних вызовов (не из публичного API).
+     * Публичное API использует {@link #getOwnedAccount}.
+     */
     @Transactional(readOnly = true)
     public Account getAccount(UUID accountId) {
         return accounts.findById(accountId).orElseThrow(() -> new AccountNotFoundException(accountId));
     }
 
     /**
-     * Счёт блокируется (FOR UPDATE) до конца транзакции: изменение баланса, проводка и запись аудита
-     * атомарны, а параллельные пополнения не затирают друг друга.
-     * Сумма уже проверена валидацией (положительная, не более 4 знаков после запятой);
-     * RoundingMode.UNNECESSARY лишь приводит масштаб к 4 и упадёт, если округление вдруг потребуется.
+     * 404, если счёта нет; 403, если он принадлежит другому пользователю. Блокировка не нужна:
+     * владелец после создания счёта не меняется.
+     */
+    @Transactional(readOnly = true)
+    public Account getOwnedAccount(UUID accountId, UUID userId) {
+        Account account = getAccount(accountId);
+        requireOwner(account, userId);
+        return account;
+    }
+
+    /**
+     * Системное пополнение без пользователя (для служебных вызовов и подготовки данных в тестах):
+     * владелец не проверяется, в аудит пишется actorId = null. Публичное API использует {@link #depositByUser}.
      */
     @Transactional
     public DepositResult deposit(UUID accountId, BigDecimal amount, String idempotencyKey) {
+        return doDeposit(accountId, null, amount, idempotencyKey);
+    }
+
+    /**
+     * Пополнение от имени пользователя: владелец счёта проверяется под блокировкой FOR UPDATE
+     * в той же транзакции, что и изменение баланса; в аудит пишется id пользователя.
+     */
+    @Transactional
+    public DepositResult depositByUser(UUID accountId, UUID userId, BigDecimal amount, String idempotencyKey) {
+        return doDeposit(accountId, userId, amount, idempotencyKey);
+    }
+
+    /**
+     * Счёт блокируется (FOR UPDATE) до конца транзакции: изменение баланса, проводка и запись аудита
+     * атомарны, а параллельные пополнения не затирают друг друга.
+     * Владелец проверяется сразу после блокировки и до проверки идемпотентности: чужой пользователь
+     * не должен получить ни проводку по ключу владельца, ни ответ о конфликте ключа.
+     * Сумма уже проверена валидацией (положительная, не более 4 знаков после запятой);
+     * RoundingMode.UNNECESSARY лишь приводит масштаб к 4 и упадёт, если округление вдруг потребуется.
+     */
+    private DepositResult doDeposit(UUID accountId, UUID userId, BigDecimal amount, String idempotencyKey) {
         if (idempotencyKey == null || idempotencyKey.isBlank() || idempotencyKey.length() > MAX_IDEMPOTENCY_KEY_LENGTH) {
             throw new InvalidIdempotencyKeyException(MAX_IDEMPOTENCY_KEY_LENGTH);
         }
         Account account = accounts.findByIdForUpdate(accountId)
                 .orElseThrow(() -> new AccountNotFoundException(accountId));
+        if (userId != null) {
+            requireOwner(account, userId);
+        }
         BigDecimal normalized = amount.setScale(4, RoundingMode.UNNECESSARY);
 
         // Ключ проверяется после блокировки счёта: два одновременных вызова с одним ключом выстроятся в очередь,
@@ -87,10 +125,16 @@ public class AccountService {
         account.credit(normalized);
         AccountTransaction tx = transactions.save(
                 AccountTransaction.deposit(account.getId(), normalized, account.getBalance(), idempotencyKey));
-        audit.record(null, AuditActions.DEPOSIT, "ACCOUNT", account.getId(),
+        audit.record(userId, AuditActions.DEPOSIT, "ACCOUNT", account.getId(),
                 Map.of("amount", normalized.toPlainString(),
                         "currency", account.getCurrency(),
                         "transactionId", tx.getId().toString()));
         return new DepositResult(tx, false);
+    }
+
+    private static void requireOwner(Account account, UUID userId) {
+        if (!account.getOwnerId().equals(userId)) {
+            throw new AccountAccessDeniedException();
+        }
     }
 }

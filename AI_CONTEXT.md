@@ -1,6 +1,6 @@
 # AI_CONTEXT — контекст проекта transfers-springboot
 
-Актуальность: на 2026-11-12, этап «account-service реализован (без JWT), ожидается подтверждение прогона тестов». После каждого этапа обновляйте разделы «Статус» и «Следующие шаги».
+Актуальность: на 2026-11-14, этап «JWT в account-service реализован (этапы 1–9), `mvn verify` подтверждён автором до этапа 4 включительно; этапы 5–8 ожидают подтверждения». После каждого этапа обновляйте разделы «Статус» и «Следующие шаги».
 
 ---
 
@@ -13,7 +13,7 @@
 - Файлы отдавать целиком, с указанием, в какую папку класть. Для нескольких файлов — архив только с новыми и изменёнными файлами; в ответе перечислять, какие файлы заменяют прежние. Архивы применяются по порядку.
 - Файлы, которых ИИ не видел (`docker-compose.yml`, `.env.example`, `Dockerfile`, `ci.yml`, init-скрипт), не переписывать с нуля: просить прислать или давать точечные правки.
 - Код: Java 21, DTO как `record`, пакеты по фичам, деньги только `BigDecimal`/`NUMERIC`, идентификаторы `UUID`, время `TIMESTAMPTZ`/`Instant`. Lombok не используется. Сущности наружу через API не отдавать.
-- Тесты делать отдельным от основного функционала шагом, по просьбе разработчика (интеграционные — на Testcontainers с реальными Postgres/Kafka/Redis).
+- Тесты писать вместе с каждым этапом, чтобы `mvn verify` оставался зелёным: интеграционные — на Testcontainers с реальными Postgres/Kafka/Redis (наследуют `IntegrationTestBase`), быстрые unit-тесты — где контекст не нужен.
 - Решения, которые меняют уже принятые, предлагать отдельно, а не вносить молча.
 
 ## 2. Технологии и версии
@@ -51,7 +51,7 @@
 
 ### Роли сервисов
 
-- **account-service** — владелец балансов и проводок: атомарно выполняет списание и зачисление, проверяет баланс и (запланировано) владельца счёта. О Kafka не знает.
+- **account-service** — владелец балансов и проводок: атомарно выполняет списание и зачисление, проверяет баланс и владельца счёта. О Kafka не знает.
 - **transfer-service** — оркестратор: публичное API переводов, идемпотентность клиента, статус перевода, вызов account-service с таймаутами и повтором, фоновое добивание зависших `PENDING`, outbox и публикация событий. Здесь же будут жить лимиты, холды, проверки (опциональные расширения).
 - **notification-service** — потребитель событий, запись уведомлений.
 
@@ -82,21 +82,15 @@
 
 Все ошибки: `{ timestamp, status, code, message, violations[] }` (`ApiError`; `violations` только при `VALIDATION_FAILED`). Стандартные ошибки Spring MVC (битый JSON, неверный UUID, нет заголовка) остаются 4xx с кодом `BAD_REQUEST`. Непредвиденное — 500 `INTERNAL_ERROR` без деталей наружу.
 
-### JWT (запланировано, ещё не реализовано)
+### JWT (реализовано в account-service)
 
-- Выдача токенов в account-service (таблица `users`, BCrypt, `POST /auth/register`, `POST /auth/login`), подпись RS256, срок access-токена ~15 минут; refresh-токены опциональны.
-- transfer-service проверяет токен по **публичному** ключу (`spring-boot-starter-oauth2-resource-server`); закрытый ключ только у account-service.
-- Обязательная проверка владения: `account.owner_id == sub` из токена; тесты на 401/403/200.
-- Позже возможно: JWKS endpoint `/.well-known/jwks.json` вместо копирования публичного ключа.
-- Ключи: `scripts/gen-keys.sh` → `keys/` (в `.gitignore`). Строки монтирования ключей в `docker-compose.yml` пока закомментированы.
-- **Что придётся изменить в account-service при внедрении JWT:**
-  - `SecurityConfig`: убрать `permitAll` для `/accounts/**`, подключить `oauth2ResourceServer`; ответы 401/403 привести к формату `ApiError`;
-  - `CreateAccountRequest`: убрать `ownerId`, владелец берётся из `sub`;
-  - проверка владельца во всех операциях со счётом (решить: 403 или 404 на чужой счёт; кто вправе пополнять);
-  - `actor_id` в аудите из токена; действия `REGISTER`, `LOGIN`;
-  - `InternalTransferRequest` получает `initiatorId`, `TransferService` проверяет, что счёт списания принадлежит ему (403) — в той же транзакции, под блокировкой;
-  - `InternalTransferResponse` дополнить `ownerId` обоих счетов (нужны notification-service);
-  - все MockMvc-тесты перевести на аутентифицированные запросы (меняется в основном `IntegrationTestBase`); добавить тесты регистрации, логина, 401/403, истёкшего токена, чужого счёта.
+- Выдача: `POST /auth/register` (201) и `POST /auth/login` (200) возвращают `{userId, accessToken, tokenType, expiresIn}`. Пароли — BCrypt, 8–72 символа и ≤72 байт UTF-8; одинаковый 401 `INVALID_CREDENTIALS` для неизвестного email и неверного пароля (с фиктивным хэшем для выравнивания времени); дубль email — 409 `EMAIL_ALREADY_REGISTERED`.
+- Токен: RS256, 15 минут (`app.jwt.access-token-ttl`), claims `sub` = User.id, `roles` (→ `ROLE_*`), `iat`, `exp`. Refresh-токенов и JWKS нет. Декодер закреплён за RS256.
+- Ключи: PEM (закрытый PKCS#8, открытый X.509, RSA ≥2048, пара должна совпадать) по путям `JWT_PRIVATE_KEY_PATH` / `JWT_PUBLIC_KEY_PATH`, без значений по умолчанию, fail-fast при старте. Файловый `JwtKeyPair` — `@Lazy`; в тестах подменяется парой в памяти (`JwtTestConfig`, `@Primary`). `scripts/gen-keys.sh` → `keys/` (в `.gitignore`). Compose монтирует `./keys:/keys:ro` в account-service и задаёт пути `/keys/...`. Для IDE/Maven пути лежат в `.env` (абсолютные, прямые слэши; Spring читает его через `spring.config.import`).
+- transfer-service (ещё не сделан) проверяет токен по **публичному** ключу (`spring-boot-starter-oauth2-resource-server`); закрытый ключ только у account-service. Строки в `docker-compose.yml` для transfer-service закомментированы и ждут его этапа.
+- Безопасность: две цепочки — `InternalSecurityConfig` (`/internal/**`, `@Order(1)`) и `SecurityConfig` (`@Order(2)`, `oauth2ResourceServer`); `ApiErrorSecurityHandler` отдаёт 401 `UNAUTHORIZED` (+`WWW-Authenticate: Bearer`) и 403 `FORBIDDEN` как `ApiError`. `/auth/register` и `/auth/login` игнорируют заголовок `Authorization`.
+- Владение: владелец = `sub` (`CurrentUser`); чужой счёт — 403, несуществующий — 404 (существование проверяется первым); роль ADMIN обхода не даёт. Пополнение — только владелец, проверка под `FOR UPDATE` до идемпотентного повтора. Внутренний перевод: `initiatorId` проверяется сразу после блокировки счетов (до поиска получателя, валюты и повтора). Ответ перевода содержит `fromOwnerId`, `toOwnerId`.
+- Аудит: `actor_id` = пользователь/инициатор, NULL только у системных действий.
 
 ## 4. Минимальный набор операций (план)
 
@@ -105,16 +99,20 @@ transfer-service: `POST /transfers` (заголовок `Idempotency-Key`); `GET
 notification-service: потребление `TransferCompleted/Failed`, запись уведомления.
 Валидации и ошибки: недостаточно средств, счёт не найден, разные валюты, сумма ≤ 0; единый формат ошибок (`@RestControllerAdvice`).
 
-### API account-service (реализовано, без аутентификации пользователя)
+### API account-service (реализовано)
+
+Все, кроме `/auth/*`, `/actuator/health/**`, `/actuator/prometheus` и `/internal/**`, требуют `Authorization: Bearer <JWT>`; без него — 401 `UNAUTHORIZED`.
 
 | Метод и путь | Назначение | Ответы |
 |---|---|---|
-| `POST /accounts` `{ownerId, currency}` | создать счёт | 201 + `Location`; 422 `OWNER_NOT_FOUND`, `CURRENCY_NOT_SUPPORTED`; 400 `VALIDATION_FAILED` |
-| `GET /accounts/{id}` | счёт с балансом | 200; 404 `ACCOUNT_NOT_FOUND` |
-| `GET /accounts/{id}/balance` | баланс | 200; 404 |
-| `POST /accounts/{id}/deposits` `{amount}` + заголовок `Idempotency-Key` (обязателен, ≤100 символов) | пополнить | 201 (выполнено), 200 (повтор того же ключа и суммы); 409 `IDEMPOTENCY_KEY_REUSED`; 400 `INVALID_IDEMPOTENCY_KEY`, `VALIDATION_FAILED`; 404 |
-| `GET /accounts/{id}/transactions?page&size` | история, новые сверху | 200 `PageResponse` (`size` 1..100, по умолчанию 20; `sort` клиента игнорируется); 404 |
-| `POST /internal/transfers` `{transferId, fromAccountId, toAccountId, amount, currency}` + `X-Internal-Token` | атомарный перевод | 201 (выполнено), 200 (повтор того же `transferId`); 409 `TRANSFER_CONFLICT`; 422 `INSUFFICIENT_FUNDS`, `CURRENCY_MISMATCH`, `SAME_ACCOUNT`; 404; 401 `UNAUTHORIZED` |
+| `POST /auth/register` `{email, password}` | регистрация + токен | 201; 409 `EMAIL_ALREADY_REGISTERED`; 400 `VALIDATION_FAILED`, `INVALID_PASSWORD` |
+| `POST /auth/login` `{email, password}` | вход | 200; 401 `INVALID_CREDENTIALS`; 400 |
+| `POST /accounts` `{currency}` | создать счёт текущего пользователя | 201 + `Location`; 422 `CURRENCY_NOT_SUPPORTED`; 400 `VALIDATION_FAILED`; 401 |
+| `GET /accounts/{id}` | счёт с балансом | 200; 403 `FORBIDDEN` (чужой); 404 `ACCOUNT_NOT_FOUND` |
+| `GET /accounts/{id}/balance` | баланс | 200; 403; 404 |
+| `POST /accounts/{id}/deposits` `{amount}` + заголовок `Idempotency-Key` (обязателен, ≤100 символов) | пополнить (только владелец) | 201 (выполнено), 200 (повтор того же ключа и суммы); 409 `IDEMPOTENCY_KEY_REUSED`; 400 `INVALID_IDEMPOTENCY_KEY`, `VALIDATION_FAILED`; 403; 404 |
+| `GET /accounts/{id}/transactions?page&size` | история (только владелец), новые сверху | 200 `PageResponse` (`size` 1..100, по умолчанию 20; `sort` клиента игнорируется); 403; 404 |
+| `POST /internal/transfers` `{transferId, initiatorId, fromAccountId, toAccountId, amount, currency}` + `X-Internal-Token` | атомарный перевод | 201 (выполнено), 200 (повтор того же `transferId`), тело с `fromOwnerId`/`toOwnerId`; 409 `TRANSFER_CONFLICT`; 403 `FORBIDDEN` (счёт списания не принадлежит `initiatorId`); 422 `INSUFFICIENT_FUNDS`, `CURRENCY_MISMATCH`, `SAME_ACCOUNT`; 404; 401 `UNAUTHORIZED` |
 
 Сумма: больше 0, до 15 цифр в целой части и до 4 в дробной (лишние знаки отклоняются, не округляются). Любая операция может вернуть 503 (см. решение 11).
 
@@ -127,7 +125,7 @@ notification-service: потребление `TransferCompleted/Failed`, зап�
 - `users(id UUID PK, email, password_hash, roles TEXT[], created_at, updated_at)`; уникальный индекс по `lower(email)`.
 - `accounts(id, owner_id → users, currency → currencies, balance NUMERIC(19,4) CHECK >= 0, version, created_at, updated_at)`; индекс по `owner_id`. Статусов у счёта нет. Ограничения «один счёт на валюту» нет.
 - `account_transactions(id, account_id → accounts, type IN (DEPOSIT, TRANSFER_DEBIT, TRANSFER_CREDIT), amount CHECK > 0, balance_after CHECK >= 0, transfer_id NULL, idempotency_key VARCHAR(100) NULL, created_at)`; `UNIQUE (transfer_id, type)`; CHECK: для переводов `transfer_id` обязателен, для пополнений должен быть NULL; **V3:** частичный уникальный индекс `uq_acc_tx_account_idem (account_id, idempotency_key) WHERE idempotency_key IS NOT NULL`, CHECK `idempotency_key` только у `DEPOSIT` и не пустой (у пополнений до V3 ключа нет); индекс `(account_id, created_at DESC, id DESC)`.
-- `audit_log(id identity, actor_id NULL, action, entity_type, entity_id, details JSONB, created_at)`; индексы по сущности и актору. Действия: `CREATE_ACCOUNT`, `DEPOSIT`, `TRANSFER` (`actor_id` пока всегда NULL).
+- `audit_log(id identity, actor_id NULL, action, entity_type, entity_id, details JSONB, created_at)`; индексы по сущности и актору. Действия: `CREATE_ACCOUNT`, `DEPOSIT`, `TRANSFER`, а также регистрация и вход; `actor_id` — пользователь (для перевода `initiatorId`), NULL только у системных действий.
 - Триггеры `forbid_modification` на `account_transactions` и `audit_log`.
 
 **transfer_db** (V1):
@@ -159,20 +157,21 @@ transfers-springboot/
 ```
 
 Пакеты по фичам. **account-service** (`io.moneyflow.account.*`):
-- `auth` — `User`, `UserRepository` (регистрация и логин ещё не реализованы);
-- `account` — `Account`, `AccountService`, `AccountController`, `Currency`, DTO (`CreateAccountRequest`, `DepositRequest`, `AccountResponse`, `BalanceResponse`, `DepositResult`), исключения;
+- `auth` — `User`, `UserRepository`, `AuthController`, `AuthService`, `JwtTokenService`, `CurrentUser`, DTO (`RegisterRequest`, `LoginRequest`, `AuthResponse`, `IssuedToken`), исключения;
+- `account` — `Account`, `AccountService`, `AccountController`, `Currency`, DTO (`CreateAccountRequest{currency}`, `DepositRequest`, `AccountResponse`, `BalanceResponse`, `DepositResult`), исключения;
 - `transaction` — `AccountTransaction` (`@Immutable`, создаётся фабриками), `TransactionType`, репозиторий, `TransactionService`, `TransactionController`, `TransactionResponse`;
 - `transfer` — `TransferService`, `InternalTransferController`, DTO и исключения внутреннего перевода;
 - `audit` — `AuditLog`, `AuditService` (`Propagation.MANDATORY`), `AuditActions`;
 - `common` — `ApiError`, `ApiException`, `GlobalExceptionHandler`, `PageResponse`;
-- `config` — `SecurityConfig` (публичное API, `@Order(2)`), `InternalSecurityConfig` (`/internal/**`, `@Order(1)`), `InternalApiTokenFilter`, `InternalApiProperties`.
+- `config` — `SecurityConfig` (публичное API, `@Order(2)`), `InternalSecurityConfig` (`/internal/**`, `@Order(1)`), `InternalApiTokenFilter`, `InternalApiProperties`, `ApiErrorSecurityHandler`, `JwtProperties`, `JwtKeyPair`, `JwtKeyLoader`, `JwtConfig`, `PasswordEncoderConfig`.
 
-Тесты account-service (`src/test`): `support/IntegrationTestBase` + `PostgresTestConfig` (один контейнер Postgres на прогон, бином); интеграционные — `AccountApiTest`, `DepositAndHistoryTest`, `DepositIdempotencyTest`, `InternalTransferTest`, `InternalApiSecurityTest`, `LedgerImmutabilityTest`, `LockTimeoutTest` (свой контекст с `lock_timeout = 500ms`, поднимает отдельный контейнер); быстрые — `DomainModelTest`, `GlobalExceptionHandlerTest`, `InternalApiTokenFilterTest`. Классы названы `*Test`, а не `*IT`: CI запускает `mvn verify` без Failsafe, `*IT` не выполнились бы. Проводки и аудит не очищаются (триггеры), тесты создают уникальные данные.
+Тесты account-service (`src/test`): `support/IntegrationTestBase` (`@Import` `PostgresTestConfig` + `JwtTestConfig`; один контейнер Postgres и один кэшированный контекст на прогон; помощники `bearer`, `expiredBearer`, `ownerBearer`, `ownerOf`); интеграционные — `AuthApiTest`, `AccountApiTest`, `AccountOwnershipTest`, `DepositAndHistoryTest`, `DepositIdempotencyTest`, `InternalTransferTest`, `InternalApiSecurityTest`, `JwtAuthenticationTest`, `SecurityConfigTest`, `PasswordEncoderConfigTest`, `JwtTokenServiceTest`, `LedgerImmutabilityTest`, `LockTimeoutTest` (свой контекст с `lock_timeout = 500ms`, отдельный контейнер); быстрые — `JwtKeyLoaderTest`, `CurrentUserTest`, `ApiErrorSecurityHandlerTest`, `DomainModelTest`, `GlobalExceptionHandlerTest`, `InternalApiTokenFilterTest`. Классы названы `*Test`, а не `*IT`: CI запускает `mvn verify` без Failsafe, `*IT` не выполнились бы. Проводки и аудит не очищаются (триггеры), тесты создают уникальные данные.
 
 ## 7. Конфигурация и запуск
 
 - `application.yml` каждого сервиса (в `src/main/resources/`) читает значения из переменных окружения со значениями по умолчанию для локальной разработки (остаются по решению автора):
-  `SERVER_PORT`, `SPRING_DATASOURCE_URL/USERNAME/PASSWORD`, `SPRING_KAFKA_BOOTSTRAP_SERVERS`, `SPRING_DATA_REDIS_HOST/PORT`, `ACCOUNT_SERVICE_URL`; в account-service ещё **`INTERNAL_API_TOKEN`** (по умолчанию `internal_dev_token`; пустое значение останавливает старт). Тот же секрет понадобится transfer-service для вызовов. Для Docker добавить переменную в `docker-compose.yml` (`INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-internal_dev_token}`) и в `.env.example`.
+  `SERVER_PORT`, `SPRING_DATASOURCE_URL/USERNAME/PASSWORD`, `SPRING_KAFKA_BOOTSTRAP_SERVERS`, `SPRING_DATA_REDIS_HOST/PORT`, `ACCOUNT_SERVICE_URL`; в account-service ещё **`INTERNAL_API_TOKEN`** (по умолчанию `internal_dev_token`; пустое значение останавливает старт). Тот же секрет понадобится transfer-service для вызовов. В Compose и `.env.example` переменная есть.
+  **`JWT_PRIVATE_KEY_PATH`, `JWT_PUBLIC_KEY_PATH`** — абсолютные пути к PEM-ключам, значений по умолчанию нет (старт без них падает). Для IDE/Maven лежат в `.env` (прямые слэши); `application.yml` подключает `.env` через `spring.config.import: optional:file:.env[.properties]` (и `../.env`). В Docker пути фиксированы в `docker-compose.yml` (`/keys/...`), хостовые из `.env` в контейнер не попадают.
 - Пароли по умолчанию: `account_dev_password`, `transfer_dev_password`, `notification_dev_password`; админ Postgres `postgres_dev_password`. Переопределяются через `.env` (`ACCOUNT_DB_PASSWORD` и т. д.). Реальные секреты не коммитить.
 - Хостовые порты инфраструктуры: **Postgres 5433** (`POSTGRES_HOST_PORT`, чтобы не конфликтовать с локальным PostgreSQL на 5432), Kafka для IDE `localhost:29092`, внутри сети Docker `kafka:9092`, Redis 6379.
 - Запуск:
@@ -203,31 +202,32 @@ transfers-springboot/
 - [x] Миграции Flyway во всех трёх сервисах, init-скрипт баз и ролей
 - [x] Dockerfile, docker-compose (профили, healthcheck, лимиты), CI на GitHub Actions
 - [x] В каждом сервисе тест «контекст поднимается и миграции применяются» на Testcontainers
-- [x] Минимальный `SecurityConfig` в account/transfer: открыты только `/actuator/health/**` и `/actuator/prometheus`, остальное закрыто
+- [x] Базовый `SecurityConfig` в account/transfer: открыты только `/actuator/health/**` и `/actuator/prometheus`, остальное закрыто
 - [x] account-service: сущности и репозитории, создание счёта, баланс, пополнение с идемпотентностью (V3), история с пагинацией, внутренний атомарный перевод с идемпотентностью по `transferId`, аудит, единый формат ошибок, 503 при сбоях блокировок, защита `/internal/**` общим секретом, пул и `lock_timeout` в `application.yml`
 - [x] Тесты account-service написаны (в том числе гонки: 50 параллельных списаний, встречные переводы, одинаковый `transferId`/`Idempotency-Key`)
 
+- [x] JWT в account-service (этапы 1–9 нового плана): ключи и загрузка, выдача токена, PasswordEncoder, регистрация/вход, ресурс-сервер с 401/403 в `ApiError`, владение счетами, история, `initiatorId` во внутреннем переводе, Compose/`.env.example`, документация; тесты написаны вместе с этапами
+
 Требует подтверждения автором (ИИ не запускал сборку и тесты — в его окружении нет Docker и зависимостей Maven):
-- [ ] `mvn -pl account-service -am clean verify` — зелёный; особенно маппинг `CHAR(3)`, `text[]`, `jsonb` при `ddl-auto: validate` и `LockTimeoutTest` (ждёт 503)
-- [ ] `INTERNAL_API_TOKEN` добавлен в `docker-compose.yml` и `.env.example`
-- [ ] Ручная проверка по чек-листу, сборка и запуск контейнера account-service
+- [x] `mvn verify` зелёный после этапа 4 (подтвердил автор)
+- [ ] `mvn verify` после этапов 5–8 (владение, история, внутренний перевод, Compose)
+- [ ] Запуск account-service с ключами: из IDE/Maven (пути в `.env`) и в контейнере (`docker compose --profile apps up -d --build account-service`); на Linux у `private.pem` с правами 600 контейнер может не прочитать файл
 - [ ] Зелёный `mvn -B verify` в CI после пуша
 
-Не сделано: JWT, transfer-service и notification-service (бизнес-логика), outbox/Kafka, метрики, нагрузочные тесты, Kubernetes.
+Не сделано: transfer-service и notification-service (бизнес-логика), outbox/Kafka, метрики, нагрузочные тесты, Kubernetes.
 
 ## 9. Следующие шаги (по порядку)
 
 1. ~~account-service без аутентификации~~ — реализовано (см. «Статус»).
-2. JWT в account-service: регистрация/логин, RS256, проверка владельца, `initiatorId` во внутреннем запросе, 401/403 в формате `ApiError`, тесты (список изменений — в разделе «JWT»).
-3. transfer-service: `POST /transfers` с идемпотентностью, клиент к `/internal/transfers` (заголовок `X-Internal-Token`, таймауты, повтор по 503 и сетевым ошибкам с тем же `transferId`, отображение 422/404/403 в `FAILED` с `failure_reason`), статусы, фоновое добивание `PENDING`.
+2. ~~JWT в account-service~~ — реализовано (см. «JWT»);
+3. transfer-service: проверка JWT по публичному ключу (раскомментировать строки в Compose), `POST /transfers` с идемпотентностью, `initiatorId` = `sub`, клиент к `/internal/transfers` (заголовок `X-Internal-Token`, таймауты, повтор по 503 и сетевым ошибкам с тем же `transferId`, отображение 422/404/403 в `FAILED` с `failure_reason`), статусы, фоновое добивание `PENDING`.
 4. Outbox + Kafka producer, notification-service с consumer и защитой от дублей.
 5. Метрики, нагрузочный тест с цифрами в README (размер пула и `lock_timeout` — параметры для подбора), затем манифесты Kubernetes (kind) и по желанию Elasticsearch для поиска по истории.
 
 ### Открытые вопросы
 
-- Кто вправе пополнять счёт после JWT (только владелец или роль админа); 403 или 404 на чужой счёт.
 - Ограничивать ли точность суммы по `currencies.minor_units` (сейчас допускается до 4 знаков независимо от валюты).
-- Нужен ли `GET /accounts` для списка счетов текущего пользователя.
+- Нужен ли `GET /accounts` для списка счетов текущего пользователя (сейчас нет).
 - Куда вынести DTO внутреннего API для клиента в transfer-service (дублировать или общий модуль; `events-contract` не подходит — без логики и зависимостей).
 - Нужен ли read-only `GET /internal/transfers/{id}` для добивания `PENDING` (повторный `POST` уже безопасен).
 - Замена общего секрета на сервисный JWT, если понадобится.

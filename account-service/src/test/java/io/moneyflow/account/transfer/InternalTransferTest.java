@@ -18,10 +18,17 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 class InternalTransferTest extends IntegrationTestBase {
 
+    /** Перевод от имени владельца счёта списания: обычный, «законный» вызов. */
     private ResultActions transfer(UUID transferId, UUID from, UUID to, String amount, String currency)
             throws Exception {
+        return transferAs(ownerOf(from), transferId, from, to, amount, currency);
+    }
+
+    private ResultActions transferAs(UUID initiatorId, UUID transferId, UUID from, UUID to, String amount,
+                                     String currency) throws Exception {
         String json = objectMapper.writeValueAsString(Map.of(
                 "transferId", transferId.toString(),
+                "initiatorId", initiatorId.toString(),
                 "fromAccountId", from.toString(),
                 "toAccountId", to.toString(),
                 "amount", new BigDecimal(amount),
@@ -64,6 +71,44 @@ class InternalTransferTest extends IntegrationTestBase {
     }
 
     @Test
+    void transfer_response_containsOwnersOfBothAccounts() throws Exception {
+        UUID from = newAccount("RUB", "100");
+        UUID to = newAccount("RUB", "0");
+
+        transfer(UUID.randomUUID(), from, to, "10", "RUB")
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.fromAccountId").value(from.toString()))
+                .andExpect(jsonPath("$.toAccountId").value(to.toString()))
+                .andExpect(jsonPath("$.fromOwnerId").value(ownerOf(from).toString()))
+                .andExpect(jsonPath("$.toOwnerId").value(ownerOf(to).toString()));
+    }
+
+    @Test
+    void transfer_writesInitiatorAsActorInAudit() throws Exception {
+        UUID from = newAccount("RUB", "100");
+        UUID to = newAccount("RUB", "0");
+        UUID transferId = UUID.randomUUID();
+
+        transfer(transferId, from, to, "10", "RUB").andExpect(status().isCreated());
+
+        UUID actor = jdbc.queryForObject(
+                "select actor_id from audit_log where action = 'TRANSFER' and entity_id = ?", UUID.class, transferId);
+        assertThat(actor).isEqualTo(ownerOf(from));
+    }
+
+    @Test
+    void transfer_toAnotherUsersAccount_isAllowed() throws Exception {
+        // Переводить можно на чужой счёт; проверяется только владелец счёта списания.
+        UUID from = newAccount("RUB", "10");
+        UUID to = newAccount("RUB", "0");
+        assertThat(ownerOf(from)).isNotEqualTo(ownerOf(to));
+
+        transfer(UUID.randomUUID(), from, to, "4", "RUB").andExpect(status().isCreated());
+
+        assertThat(balanceOf(to)).isEqualByComparingTo("4");
+    }
+
+    @Test
     void transfer_entireBalance_isAllowed() throws Exception {
         UUID from = newAccount("RUB", "10");
         UUID to = newAccount("RUB", "0");
@@ -72,6 +117,102 @@ class InternalTransferTest extends IntegrationTestBase {
 
         assertThat(balanceOf(from)).isEqualByComparingTo("0");
         assertThat(balanceOf(to)).isEqualByComparingTo("10");
+    }
+
+    // ------------------------------------------------------------------ владелец счёта списания
+
+    @Test
+    void transfer_foreignInitiator_returns403_inApiErrorFormat_andMovesNothing() throws Exception {
+        UUID from = newAccount("RUB", "100");
+        UUID to = newAccount("RUB", "0");
+        UUID transferId = UUID.randomUUID();
+
+        transferAs(newUser(), transferId, from, to, "10", "RUB")
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.status").value(403))
+                .andExpect(jsonPath("$.code").value("FORBIDDEN"))
+                .andExpect(jsonPath("$.message").exists())
+                .andExpect(jsonPath("$.timestamp").exists());
+
+        assertThat(balanceOf(from)).isEqualByComparingTo("100");
+        assertThat(balanceOf(to)).isEqualByComparingTo("0");
+        assertThat(postingsCount(transferId)).isZero();
+        assertThat(countAudit("TRANSFER", transferId)).isZero();
+    }
+
+    @Test
+    void transfer_initiatorWhoOwnsOnlyDestination_returns403() throws Exception {
+        // Получатель не вправе списывать деньги с чужого счёта.
+        UUID from = newAccount("RUB", "100");
+        UUID to = newAccount("RUB", "0");
+
+        transferAs(ownerOf(to), UUID.randomUUID(), from, to, "10", "RUB")
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.code").value("FORBIDDEN"));
+
+        assertThat(balanceOf(from)).isEqualByComparingTo("100");
+        assertThat(balanceOf(to)).isEqualByComparingTo("0");
+    }
+
+    @Test
+    void transfer_unknownInitiator_returns403() throws Exception {
+        UUID from = newAccount("RUB", "100");
+        UUID to = newAccount("RUB", "0");
+
+        transferAs(UUID.randomUUID(), UUID.randomUUID(), from, to, "10", "RUB")
+                .andExpect(status().isForbidden());
+
+        assertThat(balanceOf(from)).isEqualByComparingTo("100");
+    }
+
+    @Test
+    void transfer_foreignInitiator_learnsNothingAboutDestinationOrCurrency() throws Exception {
+        UUID from = newAccount("RUB", "100");
+
+        // Проверка владельца идёт раньше остальных: ни 404 (получателя нет), ни 422 (валюта не совпала).
+        transferAs(newUser(), UUID.randomUUID(), from, UUID.randomUUID(), "10", "RUB")
+                .andExpect(status().isForbidden());
+        transferAs(newUser(), UUID.randomUUID(), from, newAccount("USD", "0"), "10", "RUB")
+                .andExpect(status().isForbidden());
+        transferAs(newUser(), UUID.randomUUID(), from, newAccount("RUB", "0"), "1000", "RUB")
+                .andExpect(status().isForbidden()); // не 422 INSUFFICIENT_FUNDS
+    }
+
+    @Test
+    void transfer_foreignInitiator_cannotReplayCompletedTransfer() throws Exception {
+        UUID from = newAccount("RUB", "100");
+        UUID to = newAccount("RUB", "0");
+        UUID transferId = UUID.randomUUID();
+        transfer(transferId, from, to, "40", "RUB").andExpect(status().isCreated());
+
+        // Чужой не получает сохранённый результат (с суммами и владельцами) и не узнаёт о конфликте параметров.
+        transferAs(newUser(), transferId, from, to, "40", "RUB")
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.debit").doesNotExist());
+        transferAs(newUser(), transferId, from, to, "41", "RUB").andExpect(status().isForbidden());
+
+        assertThat(balanceOf(from)).isEqualByComparingTo("60");
+    }
+
+    @Test
+    void transfer_missingInitiatorId_returns400() throws Exception {
+        UUID from = newAccount("RUB", "100");
+        UUID to = newAccount("RUB", "0");
+        String json = objectMapper.writeValueAsString(Map.of(
+                "transferId", UUID.randomUUID().toString(),
+                "fromAccountId", from.toString(),
+                "toAccountId", to.toString(),
+                "amount", new BigDecimal("1"),
+                "currency", "RUB"));
+
+        mockMvc.perform(post("/internal/transfers")
+                        .header("X-Internal-Token", internalToken)
+                        .contentType(MediaType.APPLICATION_JSON).content(json))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.violations[0].field").value("initiatorId"));
+
+        assertThat(balanceOf(from)).isEqualByComparingTo("100");
     }
 
     // ------------------------------------------------------------------ отказы: деньги не двигаются
@@ -139,6 +280,7 @@ class InternalTransferTest extends IntegrationTestBase {
     void transfer_unknownSource_returns404() throws Exception {
         UUID to = newAccount("RUB", "0");
 
+        // ownerOf несуществующего счёта — случайный id: счёт не найден раньше, чем проверяется владелец
         transfer(UUID.randomUUID(), UUID.randomUUID(), to, "1", "RUB")
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.code").value("ACCOUNT_NOT_FOUND"));
@@ -165,7 +307,10 @@ class InternalTransferTest extends IntegrationTestBase {
         UUID transferId = UUID.randomUUID();
 
         JsonNode first = body(transfer(transferId, from, to, "40", "RUB").andExpect(status().isCreated()));
-        JsonNode second = body(transfer(transferId, from, to, "40", "RUB").andExpect(status().isOk()));
+        JsonNode second = body(transfer(transferId, from, to, "40", "RUB")
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.fromOwnerId").value(ownerOf(from).toString()))
+                .andExpect(jsonPath("$.toOwnerId").value(ownerOf(to).toString())));
 
         assertThat(second.get("debit").get("id").asText()).isEqualTo(first.get("debit").get("id").asText());
         assertThat(second.get("credit").get("id").asText()).isEqualTo(first.get("credit").get("id").asText());
@@ -187,7 +332,9 @@ class InternalTransferTest extends IntegrationTestBase {
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("TRANSFER_CONFLICT"));
         transfer(transferId, from, other, "40", "RUB").andExpect(status().isConflict());
-        transfer(transferId, to, from, "40", "RUB").andExpect(status().isConflict());
+        // Встречное направление: инициатор — владелец счёта to, который теперь стоит как счёт списания,
+        // поэтому проверку владельца он проходит и упирается именно в конфликт параметров.
+        transferAs(ownerOf(to), transferId, to, from, "40", "RUB").andExpect(status().isConflict());
 
         assertThat(balanceOf(from)).isEqualByComparingTo("60");
         assertThat(balanceOf(to)).isEqualByComparingTo("40");
@@ -252,5 +399,21 @@ class InternalTransferTest extends IntegrationTestBase {
         assertThat(statuses).containsOnly(201);
         assertThat(balanceOf(a).add(balanceOf(b))).isEqualByComparingTo("2000");
         assertThat(balanceOf(a)).isEqualByComparingTo("1000"); // 20 туда, 20 обратно
+    }
+
+    @Test
+    void concurrentForeignAndOwnerTransfers_foreignNeverMovesMoney() throws Exception {
+        UUID from = newAccount("RUB", "100");
+        UUID to = newAccount("RUB", "0");
+        UUID owner = ownerOf(from);
+        UUID stranger = newUser();
+
+        List<Integer> statuses = runConcurrently(20, i -> () -> transferAs(i % 2 == 0 ? owner : stranger,
+                UUID.randomUUID(), from, to, "5", "RUB").andReturn().getResponse().getStatus());
+
+        assertThat(statuses.stream().filter(s -> s == 201).count()).isEqualTo(10);
+        assertThat(statuses.stream().filter(s -> s == 403).count()).isEqualTo(10);
+        assertThat(balanceOf(from)).isEqualByComparingTo("50");
+        assertThat(balanceOf(to)).isEqualByComparingTo("50");
     }
 }

@@ -87,10 +87,11 @@ services:
       SPRING_DATASOURCE_USERNAME: account_svc
       SPRING_DATASOURCE_PASSWORD: ${ACCOUNT_DB_PASSWORD:-account_dev_password}
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-internal_dev_token}
-      # JWT-ключи добавим на шаге аутентификации:
-      #   JWT_PRIVATE_KEY_LOCATION: file:/keys/private.pem
-      #   JWT_PUBLIC_KEY_LOCATION: file:/keys/public.pem
-    # volumes: ["./keys:/keys:ro"]
+      # Ключи RS256 (создаёт scripts/gen-keys.sh). Пути здесь — внутри контейнера и не зависят от .env:
+      # хостовые пути из .env (для запуска из IDE) в контейнер не попадают.
+      JWT_PRIVATE_KEY_PATH: /keys/private.pem
+      JWT_PUBLIC_KEY_PATH: /keys/public.pem
+    volumes: ["./keys:/keys:ro"]
 
   transfer-service:
     <<: *spring-service

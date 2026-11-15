@@ -8,6 +8,7 @@ import java.util.Map;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.springframework.http.HttpHeaders.AUTHORIZATION;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -42,6 +43,7 @@ class InternalApiSecurityTest extends IntegrationTestBase {
         UUID to = newAccount("RUB", "0");
         String json = objectMapper.writeValueAsString(Map.of(
                 "transferId", UUID.randomUUID().toString(),
+                "initiatorId", ownerOf(from).toString(),
                 "fromAccountId", from.toString(),
                 "toAccountId", to.toString(),
                 "amount", 5,
@@ -81,7 +83,8 @@ class InternalApiSecurityTest extends IntegrationTestBase {
 
     @Test
     void publicApi_isNotAffected_byInternalChain() throws Exception {
-        mockMvc.perform(get("/accounts/{id}", UUID.randomUUID()))
+        // Публичное API живёт по своим правилам (JWT): с валидным токеном запрос доходит до контроллера.
+        mockMvc.perform(get("/accounts/{id}", UUID.randomUUID()).header(AUTHORIZATION, bearer(newUser())))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.code").value("ACCOUNT_NOT_FOUND"));
     }
