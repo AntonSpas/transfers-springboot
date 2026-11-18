@@ -97,20 +97,26 @@ services:
     <<: *spring-service
     build: { context: ., args: { MODULE: transfer-service } }
     ports: ["8082:8080"]
+    # Redis сервису пока не нужен (вернётся позже для лимитов переводов на пользователя), поэтому в зависимостях его нет.
     depends_on:
       postgres:        { condition: service_healthy }
       kafka:           { condition: service_healthy }
-      redis:           { condition: service_healthy }
       account-service: { condition: service_healthy }
     environment:
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/transfer_db
       SPRING_DATASOURCE_USERNAME: transfer_svc
       SPRING_DATASOURCE_PASSWORD: ${TRANSFER_DB_PASSWORD:-transfer_dev_password}
       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      SPRING_DATA_REDIS_HOST: redis
       ACCOUNT_SERVICE_URL: http://account-service:8080
-      # на шаге JWT: SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_PUBLIC_KEY_LOCATION: file:/keys/public.pem
-    # volumes: ["./keys/public.pem:/keys/public.pem:ro"]
+      # Тот же общий секрет, что у account-service: передаётся в заголовке X-Internal-Token при вызовах /internal/transfers. Пустое значение останавливает старт.
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-internal_dev_token}
+      # Только ОТКРЫТЫЙ ключ (создаёт scripts/gen-keys.sh): по нему сервис проверяет подпись токенов, выпускать токены он не может.
+      # Путь внутри контейнера, хостовый JWT_PUBLIC_KEY_PATH из .env сюда не попадает.
+      JWT_PUBLIC_KEY_PATH: /keys/public.pem
+      # Фоновое добивание зависших PENDING; false отключает его (интервалы и пороги — в application.yml)
+      PENDING_RETRY_ENABLED: ${PENDING_RETRY_ENABLED:-true}
+    # монтируется один файл: закрытого ключа в контейнере этого сервиса нет и быть не должно
+    volumes: ["./keys/public.pem:/keys/public.pem:ro"]
 
   notification-service:
     <<: *spring-service
