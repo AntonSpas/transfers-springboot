@@ -20,7 +20,7 @@
 | `notification-service` | потребление событий, создание уведомлений | `notification_db` | 8083 |
 | `events-contract` | общий контракт событий Kafka (только records и константы) | — | — |
 
-Инфраструктура: PostgreSQL 17 (один контейнер, три базы, у каждого сервиса своя роль и доступ только к своей базе), Apache Kafka 4.1 (KRaft), Redis 8.
+Инфраструктура: PostgreSQL 17 (один контейнер, три базы, у каждого сервиса своя роль и доступ только к своей базе), Apache Kafka 4.1 (KRaft), Redis 8. transfer-service Redis не использует; он понадобится позже для лимитов переводов на пользователя (после outbox и Kafka).
 
 ## Требования
 
@@ -29,7 +29,7 @@ Java 21, Maven 3.9+, Docker (с Compose v2).
 ## Быстрый старт
 
 ```bash
-# 0. Ключи JWT (нужны account-service; один раз). keys/ в .gitignore
+# 0. Ключи JWT (один раз): закрытый нужен account-service, открытый и ему, и transfer-service. keys/ в .gitignore
 ./scripts/gen-keys.sh
 
 # 1. Инфраструктура (Postgres, Kafka, Redis). Значения по умолчанию подходят для локальной разработки;
@@ -40,7 +40,7 @@ docker compose up -d
 mvn verify
 
 # 3a. Сервисы из IDE: запустите *Application классы (порты 8081/8082/8083 заданы по умолчанию).
-#     account-service нужны пути к ключам: JWT_PRIVATE_KEY_PATH и JWT_PUBLIC_KEY_PATH (см. .env.example)
+#     account-service нужны пути JWT_PRIVATE_KEY_PATH и JWT_PUBLIC_KEY_PATH, transfer-service только JWT_PUBLIC_KEY_PATH (см. .env.example)
 # 3b. ...или всё в контейнерах:
 docker compose --profile apps up -d --build
 
@@ -99,10 +99,68 @@ curl -s -X POST localhost:8081/accounts -H "Authorization: Bearer $TOKEN" -H 'Co
 
 Ключи JWT: `scripts/gen-keys.sh` создаёт `keys/private.pem` и `keys/public.pem`. Для запуска из IDE или `mvn spring-boot:run` укажите абсолютные пути в `.env` (Windows: прямые слэши, `C:/Projects/...`) — `.env` подхватывается через `spring.config.import`.
 В Docker Compose ключи монтируются в `/keys` только для чтения, пути в контейнере заданы в `docker-compose.yml`. На Linux файл `private.pem` с правами 600 может быть недоступен пользователю внутри контейнера: тогда дайте ему чтение (`chmod 644`, только для локальной разработки).
-Закрытый ключ нужен только account-service; transfer-service будет получать лишь `public.pem`.
+Закрытый ключ нужен только account-service; transfer-service получает лишь `public.pem` (в Compose монтируется один этот файл, а не вся папка `keys`). Если `keys/public.pem` не создан до `docker compose up`, Docker создаст вместо файла пустую папку: сначала выполните `./scripts/gen-keys.sh`.
 
 Интеграционные тесты идут на реальном Postgres через Testcontainers (нужен запущенный Docker). Классы называются `*Test`: в CI работает только Surefire.
 Проверка одного модуля: `mvn -pl account-service -am clean verify`.
+
+## transfer-service
+
+Публичное API переводов. Проверяет JWT только по **публичному** ключу, хранит переводы и статусы, вызывает account-service (`POST /internal/transfers`), добивает зависшие переводы. Все эндпоинты, кроме health и prometheus, требуют `Authorization: Bearer <token>` (токен выдаёт account-service). Инициатор перевода это `sub` токена, в теле запроса его нет.
+
+| Метод и путь | Назначение |
+|---|---|
+| `POST /transfers` `{fromAccountId, toAccountId, amount, currency}` + заголовок `Idempotency-Key` | создать перевод; ключ обязателен, до 100 символов |
+| `GET /transfers/{id}` | перевод (только инициатору) |
+
+Ответ: `{ id, fromAccountId, toAccountId, amount, currency, status, failureReason, createdAt, updatedAt }`, `status` это `PENDING`, `COMPLETED` или `FAILED`.
+
+Ответы `POST /transfers`:
+
+| Код | Когда |
+|---|---|
+| 201 | перевод создан и обработан сейчас: `COMPLETED`, либо `FAILED` с `failureReason` (`INSUFFICIENT_FUNDS`, `CURRENCY_MISMATCH`, `ACCOUNT_NOT_FOUND`, `FORBIDDEN`) |
+| 200 | повтор с тем же ключом и теми же параметрами: возвращается сохранённое состояние; если перевод был `PENDING`, он сначала дообрабатывается |
+| 202 | перевод принят, но account-service недоступен: статус `PENDING`, его добьёт фоновая задача; повторите запрос с тем же ключом |
+| 409 `IDEMPOTENCY_KEY_REUSED` | тот же ключ с другими параметрами; лечится только новым ключом |
+| 422 `SAME_ACCOUNT` | счета совпадают |
+| 400 `INVALID_IDEMPOTENCY_KEY`, `VALIDATION_FAILED` | нет или неверный ключ, неверное тело (сумма больше 0, до 15 и 4 знаков, валюта из 3 заглавных букв) |
+| 502 `UPSTREAM_ERROR` | account-service ответил так, что это ошибка конфигурации или баг (например, неверный секрет); перевод остаётся `PENDING`, подробности только в логах |
+| 401 `UNAUTHORIZED` | нет, просрочен или неверен токен |
+
+`GET /transfers/{id}`: 404 `TRANSFER_NOT_FOUND`, если перевода нет; 403 `FORBIDDEN`, если он чужой (роль ADMIN обхода не даёт). Проверка существования идёт первой.
+
+Правило для клиента то же, что в account-service: 202 и 503 значат «повторите с тем же `Idempotency-Key`».
+
+Как устроена обработка: перевод вставляется в `PENDING` короткой транзакцией, вызов account-service идёт **вне транзакции** (с таймаутами и повтором с тем же `transferId`), затем короткая транзакция ставит `COMPLETED` или `FAILED`, и только из `PENDING`. Если account-service недоступен, перевод остаётся `PENDING`, и раз в `interval` фоновая задача (`@Scheduled`, `FOR UPDATE SKIP LOCKED`) дообрабатывает переводы старше `min-age`. account-service идемпотентен по `transferId`, поэтому повторы не двигают деньги дважды.
+
+Переменные окружения: `SERVER_PORT` (по умолчанию 8082), `JWT_PUBLIC_KEY_PATH` (без значения по умолчанию: без ключа сервис не стартует), `INTERNAL_API_TOKEN` (тот же секрет, что у account-service; по умолчанию `internal_dev_token`, пустое значение останавливает старт), `ACCOUNT_SERVICE_URL` (по умолчанию `http://localhost:8081`), `PENDING_RETRY_ENABLED` (по умолчанию `true`). Таймауты, число попыток и параметры добивания (`app.pending-retry.interval`, `min-age`, `batch-size`) лежат в `application.yml`.
+
+Redis сервису пока не нужен: он вернётся позже для лимитов переводов на пользователя, после outbox и публикации в Kafka.
+
+### Ручная проверка transfer-service
+
+Нужны ключи (`./scripts/gen-keys.sh`) и запущенные Postgres и account-service; transfer-service запускается из IDE (в `.env` заданы `JWT_PUBLIC_KEY_PATH`) или `docker compose --profile apps up -d --build`. Пример для bash:
+
+```bash
+reg() { curl -s -X POST localhost:8081/auth/register -H 'Content-Type: application/json' \
+  -d "{\"email\":\"$1\",\"password\":\"password123\"}" | sed -E 's/.*"accessToken":"([^"]+)".*/\1/'; }
+id()  { sed -E 's/.*"id":"([^"]+)".*/\1/'; }
+A=$(reg a$RANDOM@example.com); B=$(reg b$RANDOM@example.com)
+acc() { curl -s -X POST localhost:8081/accounts -H "Authorization: Bearer $1" -H 'Content-Type: application/json' -d '{"currency":"RUB"}' | id; }
+FROM=$(acc $A); TO=$(acc $B)
+curl -s -X POST localhost:8081/accounts/$FROM/deposits -H "Authorization: Bearer $A" -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: dep-1' -d '{"amount":100}'
+
+# 1) перевод: 201, COMPLETED
+curl -i -X POST localhost:8082/transfers -H "Authorization: Bearer $A" -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: k-1' -d "{\"fromAccountId\":\"$FROM\",\"toAccountId\":\"$TO\",\"amount\":10,\"currency\":\"RUB\"}"
+# 2) тот же ключ и тело: 200 и тот же id; другая сумма с тем же ключом: 409 IDEMPOTENCY_KEY_REUSED
+# 3) GET /transfers/<id> с токеном B: 403 FORBIDDEN; с токеном A: 200; случайный UUID: 404
+# 4) недостаточно средств (amount 1000000): 201 и status FAILED, failureReason INSUFFICIENT_FUNDS
+# 5) остановите account-service и отправьте новый перевод: 202 и PENDING; запустите account-service снова:
+#    в течение min-age + interval (около 1,5 минут) статус станет COMPLETED, это видно по GET
+```
 
 ## events-contract
 
@@ -126,7 +184,7 @@ curl -s -X POST localhost:8081/accounts -H "Authorization: Bearer $TOKEN" -H 'Co
 - [x] Каркас: Maven-модули, Dockerfile, Compose, миграции, проверка контекста на Testcontainers
 - [x] account-service: счета, пополнение (идемпотентное), история, внутренний перевод, защита `/internal` общим секретом
 - [x] JWT-аутентификация в account-service: регистрация, вход, RS256, владение счетами, `initiatorId` во внутреннем переводе
-- [ ] transfer-service: идемпотентные переводы, вызов account-service
+- [x] transfer-service: JWT по публичному ключу, идемпотентные переводы, вызов account-service с таймаутами и повтором, `GET /transfers/{id}`, фоновое добивание `PENDING`
 - [ ] Outbox и публикация в Kafka, notification-service
 - [ ] Нагрузочный тест, метрики, манифесты Kubernetes
 

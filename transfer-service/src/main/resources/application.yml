@@ -4,6 +4,12 @@ server:
 spring:
   application:
     name: transfer-service
+  # Локальные значения для запуска из IDE/Maven (JWT_PUBLIC_KEY_PATH и др.) лежат в общем .env.
+  # Формат .properties: пути только с прямыми слэшами (C:/Projects/...).
+  config:
+    import:
+      - optional:file:.env[.properties]
+      - optional:file:../.env[.properties]
   threads:
     virtual:
       enabled: true
@@ -13,10 +19,6 @@ spring:
     password: ${SPRING_DATASOURCE_PASSWORD:transfer_dev_password}
   kafka:
     bootstrap-servers: ${SPRING_KAFKA_BOOTSTRAP_SERVERS:localhost:29092}
-  data:
-    redis:
-      host: ${SPRING_DATA_REDIS_HOST:localhost}
-      port: ${SPRING_DATA_REDIS_PORT:6379}
   jpa:
     open-in-view: false
     hibernate:
@@ -32,6 +34,34 @@ management:
       probes:
         enabled: true
 
-# Адрес account-service для внутренних вызовов
+app:
+  jwt:
+    # Путь к public.pem (X.509 PEM). Значения по умолчанию нет: пустой путь останавливает старт
+    # с понятным сообщением. Закрытого ключа у этого сервиса нет и быть не должно.
+    public-key-path: ${JWT_PUBLIC_KEY_PATH:}
+
+  # Фоновое добивание переводов, зависших в PENDING (account-service был недоступен)
+  pending-retry:
+    # Выключатель: false отключает планировщик (сам код остаётся). По умолчанию включено.
+    enabled: ${PENDING_RETRY_ENABLED:true}
+    # Пауза между запусками (отсчёт от конца предыдущего, запуски не накладываются).
+    interval: 30s
+    # Трогаем только переводы старше этого возраста: свежий PENDING, скорее всего, прямо сейчас
+    # обрабатывается запросом клиента. Должно быть заметно больше времени одного вызова
+    # (max-attempts x read-timeout + паузы).
+    min-age: 60s
+    # Сколько переводов берём за один запуск (самые старые первыми).
+    batch-size: 50
+
+# Внутренние вызовы account-service (POST /internal/transfers)
 account-service:
   url: ${ACCOUNT_SERVICE_URL:http://localhost:8081}
+  # Общий секрет для заголовка X-Internal-Token; тот же, что у account-service.
+  # Пустое значение останавливает старт. В логи не попадает.
+  internal-token: ${INTERNAL_API_TOKEN:internal_dev_token}
+  connect-timeout: 2s
+  read-timeout: 5s
+  # Повтор при 503, 5xx, таймауте и сетевой ошибке (с тем же transferId): всего попыток за один вызов и пауза между ними.
+  # После исчерпания перевод остаётся PENDING, его добьёт фоновая задача.
+  max-attempts: 3
+  retry-backoff: 200ms
