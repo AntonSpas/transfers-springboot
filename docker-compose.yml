@@ -115,6 +115,9 @@ services:
       JWT_PUBLIC_KEY_PATH: /keys/public.pem
       # Фоновое добивание зависших PENDING; false отключает его (интервалы и пороги — в application.yml)
       PENDING_RETRY_ENABLED: ${PENDING_RETRY_ENABLED:-true}
+      # Публикация outbox в Kafka (планировщик и создание топика transfers.events.v1); false отключает её,
+      # события при этом копятся в outbox_events (интервал, размер партии и таймаут — в application.yml)
+      OUTBOX_ENABLED: ${OUTBOX_ENABLED:-true}
     # монтируется один файл: закрытого ключа в контейнере этого сервиса нет и быть не должно
     volumes: ["./keys/public.pem:/keys/public.pem:ro"]
 

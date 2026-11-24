@@ -1,6 +1,6 @@
 # AI_CONTEXT — контекст проекта transfers-springboot
 
-Актуальность: на 2026-11-17, этап «transfer-service реализован (этапы 1–12 плана transfer-service), `mvn verify` подтверждён автором до этапа 10 включительно; этап 11 (фоновое добивание) и ручной запуск ожидают подтверждения». После каждого этапа обновляйте разделы «Статус» и «Следующие шаги».
+Актуальность: на 2026-11-23, «transfer-service реализован полностью: JWT, переводы с идемпотентностью, фоновое добивание `PENDING`, outbox и публикация в Kafka; `mvn verify` и ручная проверка пройдены автором». После каждого этапа обновляйте разделы «Статус» и «Следующие шаги».
 
 ---
 
@@ -13,7 +13,7 @@
 - Файлы отдавать целиком, с указанием, в какую папку класть. Для нескольких файлов — архив только с новыми и изменёнными файлами; в ответе перечислять, какие файлы заменяют прежние. Архивы применяются по порядку.
 - Файлы, которых ИИ не видел (`docker-compose.yml`, `.env.example`, `Dockerfile`, `ci.yml`, init-скрипт), не переписывать с нуля: просить прислать или давать точечные правки.
 - Код: Java 21, DTO как `record`, пакеты по фичам, деньги только `BigDecimal`/`NUMERIC`, идентификаторы `UUID`, время `TIMESTAMPTZ`/`Instant`. Lombok не используется. Сущности наружу через API не отдавать.
-- Тесты писать вместе с каждым этапом, чтобы `mvn verify` оставался зелёным: интеграционные — на Testcontainers с реальными зависимостями (сейчас Postgres; Kafka-тесты на Testcontainers будут в задаче outbox; наследуют `IntegrationTestBase`), быстрые unit-тесты — где контекст не нужен.
+- Тесты писать вместе с каждым этапом, чтобы `mvn verify` оставался зелёным: интеграционные — на Testcontainers с реальными зависимостями (Postgres и Kafka; наследуют `IntegrationTestBase`, тесты с брокером наследуют `KafkaIntegrationTestBase`), быстрые unit-тесты — где контекст не нужен.
 - Решения, которые меняют уже принятые, предлагать отдельно, а не вносить молча.
 
 ## 2. Технологии и версии
@@ -25,8 +25,9 @@
 | БД | PostgreSQL 17 (`postgres:17`), миграции Flyway (`flyway-core` + `flyway-database-postgresql`) |
 | Пул соединений | HikariCP (автоконфигурация Boot), `maximum-pool-size: 10` задан явно, `lock_timeout = 5s` через `connection-init-sql` |
 | Брокер | Apache Kafka 4.1.1 (`apache/kafka:4.1.1`, KRaft, один узел) |
+| Kafka-клиент / тесты | `spring-kafka` (версия Boot 3.5.16), продюсер `acks=all`, идемпотентный; тесты: `org.testcontainers:kafka`, `org.testcontainers.kafka.KafkaContainer`, образ `apache/kafka:4.1.1` |
 | Кэш | Redis 8 (`redis:8.10-alpine`): контейнер в Compose есть, **transfer-service его не использует** (убран из `pom.xml` и `application.yml`); вернётся для лимитов переводов на пользователя после outbox и Kafka |
-| Образы приложений | сборка `maven:3.9-eclipse-temurin-21` (**тег не подтверждён**, может потребоваться замена), запуск `eclipse-temurin:21-jre` |
+| Образы приложений | сборка `maven:3.9-eclipse-temurin-21`, запуск `eclipse-temurin:21-jre` |
 | Тесты | JUnit 5, Testcontainers (через `spring-boot-testcontainers`, `@ServiceConnection`) |
 | Метрики | Actuator + Micrometer Prometheus; включены виртуальные потоки (`spring.threads.virtual.enabled=true`) |
 
@@ -52,10 +53,10 @@
 ### Роли сервисов
 
 - **account-service** — владелец балансов и проводок: атомарно выполняет списание и зачисление, проверяет баланс и владельца счёта. О Kafka не знает.
-- **transfer-service** — оркестратор: публичное API переводов, идемпотентность клиента, статус перевода, вызов account-service с таймаутами и повтором, фоновое добивание зависших `PENDING` (реализовано), outbox и публикация событий (ещё нет). Здесь же будут жить лимиты (в том числе на Redis), холды, проверки (опциональные расширения).
+- **transfer-service** — оркестратор: публичное API переводов, идемпотентность клиента, статус перевода, вызов account-service с таймаутами и повтором, фоновое добивание зависших `PENDING` (реализовано), outbox и публикация событий в Kafka (реализовано). Здесь же будут жить лимиты (в том числе на Redis), холды, проверки (опциональные расширения).
 - **notification-service** — потребитель событий, запись уведомлений.
 
-Порядок одного перевода: проверить JWT → вставить `transfer` в статусе `PENDING` (при дубле ключа вернуть существующий) → вызвать account-service (вне транзакции БД) → в короткой транзакции выставить `COMPLETED`/`FAILED` (событие в outbox добавится в задаче outbox, сейчас его нет). Сбой между вызовом и записью статуса закрывается повтором того же `transferId`: account-service идемпотентен.
+Порядок одного перевода: проверить JWT → вставить `transfer` в статусе `PENDING` (при дубле ключа вернуть существующий) → вызвать account-service (вне транзакции БД) → в короткой транзакции выставить `COMPLETED`/`FAILED` и в той же транзакции записать событие в `outbox_events` (только при реальном переходе); отдельный проход publisher отправляет его в Kafka. Сбой между вызовом и записью статуса закрывается повтором того же `transferId`: account-service идемпотентен.
 
 ### Ключевые решения
 
@@ -70,14 +71,15 @@
    - transfer-service → account-service: `UNIQUE (transfer_id, type)` в `account_transactions`;
    - клиент → account-service (пополнения): обязательный `Idempotency-Key`, уникальный индекс `(account_id, idempotency_key)`;
    - Kafka → notification-service: `UNIQUE (source_event_id)` в `notifications`.
-6. **Transactional outbox:** событие пишется в `outbox_events` в той же транзакции, что и перевод; отдельный publisher (`@Scheduled`, `FOR UPDATE SKIP LOCKED`) отправляет в Kafka и ставит `published_at`. Доставка at-least-once, консьюмер идемпотентен.
+6. **Transactional outbox:** событие пишется в `outbox_events` в той же транзакции, что и перевод; отдельный publisher (`@Scheduled`, `FOR UPDATE SKIP LOCKED`) отправляет в Kafka и ставит `published_at`. Доставка at-least-once, консьюмер идемпотентен. Реализовано в transfer-service (решения 38–45 в `docs/decisions.md`).
 7. **Защита от гонок:** основная — пессимистичная блокировка `SELECT ... FOR UPDATE`; `@Version` — страховка от забытой блокировки; перевод блокирует оба счёта одним запросом в порядке `id` (нет deadlock встречных переводов); `CHECK (balance >= 0)` — последний рубеж. Проверка повтора идемпотентной операции делается **после** блокировки счёта.
 8. `account_transactions` и `audit_log` неизменяемы (триггеры запрещают UPDATE/DELETE); исправления — новыми записями.
-9. **События:** один топик `transfers.events.v1`, тип события в заголовке Kafka `event-type` (`TransferCompleted`, `TransferFailed`). Правила контракта: только добавлять необязательные поля; несовместимое изменение — новый топик `v2`.
+9. **События:** один топик `transfers.events.v1`, тип события в заголовке Kafka `event-type` (`TransferCompleted`, `TransferFailed`). Правила контракта: только добавлять необязательные поля; несовместимое изменение — новый топик `v2`. `TransferCompleted` содержит необязательное `toOwnerId` (получатель), `TransferFailed` владельцев не содержит. Заголовки: `event-type` (контракт) и `event-id` (= `event_id`, константа в `OutboxPublisher`). Ключ сообщения — id перевода.
 10. Двойная запись (ledger), холды, лимиты, конвертация валют — **опциональные расширения**, в базовую версию не входят.
 11. **Временные сбои конкуренции** (таймаут блокировки, deadlock, конфликт версий) отдаются как **503 + `Retry-After: 1`**, коды `RESOURCE_BUSY` / `CONCURRENT_MODIFICATION`. Клиентское правило: 503 = повтори с тем же ключом. 409 остаётся только за конфликтом параметров (`TRANSFER_CONFLICT`, `IDEMPOTENCY_KEY_REUSED`), он повтором не лечится.
 12. **Защита `/internal/**` — общий секрет** в заголовке `X-Internal-Token` (переменная `INTERNAL_API_TOKEN`), отдельная цепочка безопасности; пользовательский JWT доступа к `/internal` не даёт. Путь развития — сервисный JWT.
 13. **transfer-service** (решения 29–37 в `docs/decisions.md`): JWT только по публичному ключу; явные короткие транзакции и вызов account-service вне транзакции; 4xx account-service 401/400/409 это 502 и `PENDING`, а не `FAILED`; идемпотентность клиента на уникальном индексе с перехватом нарушения; 404 раньше 403 и без обхода для ADMIN; фоновое добивание с `SKIP LOCKED` и флагом; Redis убран, вернётся для лимитов.
+14. **transfer-service: outbox и Kafka** (решения 38–45): событие пишется в транзакции финализации и только при реальном переходе (одно событие на перевод); `toOwnerId` добавлен в `TransferCompleted`; publisher выбирает и отправляет партию в одной транзакции с `SKIP LOCKED` (осознанное исключение из правила «внешний вызов вне транзакции»), при первой ошибке проход прекращается; продюсер с ограниченными таймаутами; флаг `OUTBOX_ENABLED`; DLQ и очистки опубликованных строк нет.
 
 ### Формат ошибок account-service
 
@@ -130,6 +132,13 @@ notification-service: потребление `TransferCompleted/Failed`, зап�
 
 Фоновое добивание (`PendingTransferRetrier`, `PendingRetryScheduling`): `app.pending-retry.enabled` (env `PENDING_RETRY_ENABLED`, по умолчанию `true`), `interval: 30s`, `min-age: 60s`, `batch-size: 50`; выбор партии `FOR UPDATE SKIP LOCKED` в короткой транзакции, обработка вне транзакции; при недоступности account-service проход прекращается; перевод с постоянным 502 вытесняет новые из партии (известное ограничение). В общем тестовом контексте планировщик выключен, логика проверяется вызовом `runOnce()`.
 
+### transfer-service: outbox и публикация в Kafka (реализовано)
+
+- Запись: `TransferProcessor.finalizeTransfer` вызывает `OutboxWriter` (`Propagation.MANDATORY`) только при `applied == true`: `writeTransferCompleted(transfer, toOwnerId, now)` (владелец получателя из ответа account-service) или `writeTransferFailed(transfer, now)`. Конструктор процессора: `(TransferRepository, AccountServiceClient, OutboxWriter, PlatformTransactionManager, Clock)`. `OutboxEvent` (`Persistable`, `payload` JSONB строкой), `OutboxRepository.lockUnpublished(limit)` (native, `SKIP LOCKED`, `MANDATORY`).
+- Публикация: `OutboxPublisher.runOnce()` возвращает `Report(selected, published, stoppedEarly)`; одна транзакция: выборка, отправка по порядку с ожиданием `send-timeout`, `markPublished`; при первой ошибке остановка. `OutboxScheduling` (флаг `app.outbox.enabled`, пауза от конца прохода), `OutboxTopicConfig` (`NewTopic` `transfers.events.v1`, 3 партиции, 1 реплика, только при включённой публикации), `OutboxProperties` (`enabled` / `OUTBOX_ENABLED` = `true`, `interval` 1s, `batch-size` 100, не больше 1000, `send-timeout` 5s) и `OutboxConfig`.
+- Продюсер: `spring.kafka.producer.*` в `application.yml` (`acks=all`, идемпотентность, `linger.ms=5`, `request.timeout.ms=3000`, `delivery.timeout.ms=5000`, `max.block.ms=3000`).
+- Сообщение: ключ = `aggregate_id`, значение = JSON события, заголовки `event-type` и `event-id`.
+
 ## 5. Структура БД
 
 Миграции V1, V2 применялись на PostgreSQL 16 с проверкой ограничений; V3 проверяется интеграционными тестами на `postgres:17`.
@@ -166,7 +175,7 @@ transfers-springboot/
 ├── scripts/gen-keys.sh
 ├── events-contract/                # Topics, EventTypes, TransferCompletedEvent, TransferFailedEvent
 ├── account-service/                # см. ниже
-├── transfer-service/               # io.moneyflow.transfer: common, config, client, transfer; db/migration V1
+├── transfer-service/               # io.moneyflow.transfer: common, config, client, transfer, outbox; db/migration V1
 └── notification-service/           # io.moneyflow.notification, db/migration V1
 ```
 
@@ -183,16 +192,19 @@ transfers-springboot/
 - `common` — `ApiError`, `ApiException`, `GlobalExceptionHandler`, `CurrentUser` (UUID из `sub`), `UnauthorizedException`;
 - `config` — `SecurityConfig`, `ApiErrorSecurityHandler`, `JwtProperties`, `JwtPublicKeyLoader`, `JwtKeyException`, `JwtConfig` (файловые бины `@Lazy`), `ClockConfig`;
 - `client` — `AccountClientProperties`, `AccountClientConfig` (`RestClient`), `AccountServiceClient`, `AccountCallResult` (sealed: `Completed`/`Rejected`/`Unavailable`/`UpstreamError`), `InternalTransferRequest`/`InternalTransferResult` (дубли DTO account-service);
-- `transfer` — `Transfer` (`Persistable`), `TransferStatus`, `TransferRepository` (`findByIdForUpdate`, `lockStalePending`), `TransferProcessor` (транзакции через `TransactionTemplate`), `KeyedLock`, `ProcessingResult`, `TransferService`, `TransferController`, DTO (`CreateTransferRequest`, `TransferResponse`, `CreateTransferResult`), исключения (`SameAccountException`, `InvalidIdempotencyKeyException`, `IdempotencyKeyReusedException`, `UpstreamErrorException`, `TransferNotFoundException`, `TransferAccessDeniedException`), `PendingRetryProperties`, `PendingRetryConfig`, `PendingTransferRetrier`, `PendingRetryScheduling`.
+- `transfer` — `Transfer` (`Persistable`), `TransferStatus`, `TransferRepository` (`findByIdForUpdate`, `lockStalePending`), `TransferProcessor` (транзакции через `TransactionTemplate`), `KeyedLock`, `ProcessingResult`, `TransferService`, `TransferController`, DTO (`CreateTransferRequest`, `TransferResponse`, `CreateTransferResult`), исключения (`SameAccountException`, `InvalidIdempotencyKeyException`, `IdempotencyKeyReusedException`, `UpstreamErrorException`, `TransferNotFoundException`, `TransferAccessDeniedException`), `PendingRetryProperties`, `PendingRetryConfig`, `PendingTransferRetrier`, `PendingRetryScheduling`;
+- `outbox` — `OutboxEvent`, `OutboxRepository`, `OutboxWriter`, `OutboxPublisher`, `OutboxScheduling`, `OutboxTopicConfig`, `OutboxProperties`, `OutboxConfig`.
 
 Тесты transfer-service: `support/` (`IntegrationTestBase` с `account-service.retry-backoff=0ms` и выключенным добиванием, `PostgresTestConfig`, `JwtTestConfig`, `TestTokens`, `AccountMock` на `MockRestServiceServer` с `@Primary` `RestClient`, `AccountMockTestConfig`), быстрые тесты (`TransferTest`, `KeyedLockTest`, `TransferServiceTest`, `TransferServiceGetTest`, `PendingRetryPropertiesTest`, `PendingRetrySchedulingTest`, конфигурация JWT и клиента, обработчики ошибок), интеграционные (`TransferRepositoryTest`, `TransferProcessorTest`, `TransferProcessorIntegrationTest`, `TransferCreateApiTest`, `TransferIdempotencyApiTest`, `TransferGetApiTest`, `TransferRaceApiTest`, `PendingTransferRetrierIntegrationTest`, `SecurityConfigTest`, `JwtKeyStartupTest`). Ожидания `MockRestServiceServer` регистрируются до первого запроса. Ожидаемые `ERROR` в логах тестов, провоцирующих ошибки, не подавляются.
+
+Тесты outbox (transfer-service): `outbox/` — `OutboxEventTest`, `OutboxPropertiesTest`, `OutboxSchedulingTest` (быстрые); `OutboxRepositoryIntegrationTest`, `OutboxWriterIntegrationTest`, `OutboxPublisherIntegrationTest` (общий контекст, `KafkaTemplate` подменён Mockito), `OutboxDisabledInSharedContextTest`, `TransferOutboxApiTest` (сквозной `POST /transfers` → `outbox_events`), `OutboxKafkaIntegrationTest` (настоящий брокер); `transfer/TransferProcessorOutboxIntegrationTest` (запись, гонка двух экземпляров, откат). `IntegrationTestBase` выключает публикацию (`app.outbox.enabled=false`); `KafkaIntegrationTestBase` + `KafkaTestConfig` дают единственный дополнительный контекст (свой Postgres и Kafka, планировщик с интервалом в час, проходы вызываются из теста). Тесты `outbox_events` чистят таблицу перед собой или ищут свои события по `aggregate_id`.
 
 Тесты account-service (`src/test`): `support/IntegrationTestBase` (`@Import` `PostgresTestConfig` + `JwtTestConfig`; один контейнер Postgres и один кэшированный контекст на прогон; помощники `bearer`, `expiredBearer`, `ownerBearer`, `ownerOf`); интеграционные — `AuthApiTest`, `AccountApiTest`, `AccountOwnershipTest`, `DepositAndHistoryTest`, `DepositIdempotencyTest`, `InternalTransferTest`, `InternalApiSecurityTest`, `JwtAuthenticationTest`, `SecurityConfigTest`, `PasswordEncoderConfigTest`, `JwtTokenServiceTest`, `LedgerImmutabilityTest`, `LockTimeoutTest` (свой контекст с `lock_timeout = 500ms`, отдельный контейнер); быстрые — `JwtKeyLoaderTest`, `CurrentUserTest`, `ApiErrorSecurityHandlerTest`, `DomainModelTest`, `GlobalExceptionHandlerTest`, `InternalApiTokenFilterTest`. Классы названы `*Test`, а не `*IT`: CI запускает `mvn verify` без Failsafe, `*IT` не выполнились бы. Проводки и аудит не очищаются (триггеры), тесты создают уникальные данные.
 
 ## 7. Конфигурация и запуск
 
 - `application.yml` каждого сервиса (в `src/main/resources/`) читает значения из переменных окружения со значениями по умолчанию для локальной разработки (остаются по решению автора):
-  `SERVER_PORT`, `SPRING_DATASOURCE_URL/USERNAME/PASSWORD`, `SPRING_KAFKA_BOOTSTRAP_SERVERS`; **`INTERNAL_API_TOKEN`** (по умолчанию `internal_dev_token`; пустое значение останавливает старт) нужен и account-service (проверяет), и transfer-service (отправляет), значение должно совпадать. transfer-service дополнительно: `ACCOUNT_SERVICE_URL` (по умолчанию `http://localhost:8081`, в Compose `http://account-service:8080`), `PENDING_RETRY_ENABLED` (по умолчанию `true`); `SPRING_DATA_REDIS_*` ему не нужны. В Compose и `.env.example` переменные есть.
+  `SERVER_PORT`, `SPRING_DATASOURCE_URL/USERNAME/PASSWORD`, `SPRING_KAFKA_BOOTSTRAP_SERVERS`; **`INTERNAL_API_TOKEN`** (по умолчанию `internal_dev_token`; пустое значение останавливает старт) нужен и account-service (проверяет), и transfer-service (отправляет), значение должно совпадать. transfer-service дополнительно: `ACCOUNT_SERVICE_URL` (по умолчанию `http://localhost:8081`, в Compose `http://account-service:8080`), `PENDING_RETRY_ENABLED` (по умолчанию `true`), `OUTBOX_ENABLED` (по умолчанию `true`); `SPRING_DATA_REDIS_*` ему не нужны. В Compose и `.env.example` переменные есть.
   **`JWT_PRIVATE_KEY_PATH`, `JWT_PUBLIC_KEY_PATH`** — абсолютные пути к PEM-ключам, значений по умолчанию нет (старт без них падает); account-service нужны оба, transfer-service только `JWT_PUBLIC_KEY_PATH`. Для IDE/Maven лежат в `.env` (прямые слэши); `application.yml` подключает `.env` через `spring.config.import: optional:file:.env[.properties]` (и `../.env`). В Docker пути фиксированы в `docker-compose.yml` (`/keys/...`), хостовые из `.env` в контейнер не попадают.
 - Пароли по умолчанию: `account_dev_password`, `transfer_dev_password`, `notification_dev_password`; админ Postgres `postgres_dev_password`. Переопределяются через `.env` (`ACCOUNT_DB_PASSWORD` и т. д.). Реальные секреты не коммитить.
 - Хостовые порты инфраструктуры: **Postgres 5433** (`POSTGRES_HOST_PORT`, чтобы не конфликтовать с локальным PostgreSQL на 5432), Kafka для IDE `localhost:29092`, внутри сети Docker `kafka:9092`, Redis 6379 (контейнер есть, transfer-service им не пользуется).
@@ -216,6 +228,7 @@ transfers-springboot/
 - **Порт хоста 8081 один:** либо сервис из IDE/Maven, либо контейнер. Для одновременной работы запускать IDE-копию с `SERVER_PORT=8091`. Конфликт даёт `ports are not available` в Docker; `SERVER_PORT=8080` в Dockerfile относится только к порту внутри контейнера.
 - **`restart: unless-stopped`** поднимает ранее созданные контейнеры (в том числе приложений, профиль не мешает) после перезапуска Docker, и они занимают порты 8081–8083. Для сервисов приложений рекомендовано убрать `restart` или поставить `"no"`.
 - Контейнер приложения собран из кода на момент `--build`: после изменений пересобирать.
+- **Kafka недоступна при старте transfer-service с включённым outbox:** `KafkaAdmin` может ждать создания топика до 30 с, затем сервис продолжает работу. `OUTBOX_ENABLED=false` убирает это ожидание; события копятся в `outbox_events` и уходят после включения.
 
 ## 8. Статус
 
@@ -230,30 +243,39 @@ transfers-springboot/
 
 - [x] JWT в account-service (этапы 1–9 нового плана): ключи и загрузка, выдача токена, PasswordEncoder, регистрация/вход, ресурс-сервер с 401/403 в `ApiError`, владение счетами, история, `initiatorId` во внутреннем переводе, Compose/`.env.example`, документация; тесты написаны вместе с этапами
 
-Требует подтверждения автором (ИИ не запускал сборку и тесты — в его окружении нет Docker и зависимостей Maven):
-- [x] `mvn verify` зелёный после этапа 4 (подтвердил автор)
-- [ ] `mvn verify` после этапов 5–8 (владение, история, внутренний перевод, Compose)
-- [ ] Запуск account-service с ключами: из IDE/Maven (пути в `.env`) и в контейнере (`docker compose --profile apps up -d --build account-service`); на Linux у `private.pem` с правами 600 контейнер может не прочитать файл
+- [x] `mvn verify` зелёный, account-service запускается с ключами из IDE/Maven и в контейнере (подтвердил автор)
 - [ ] Зелёный `mvn -B verify` в CI после пуша
 
 - [x] transfer-service (этапы 1–12): JWT по публичному ключу, `POST /transfers` с идемпотентностью (201/200/202/409/422/502), `GET /transfers/{id}`, клиент account-service (таймауты, повтор с тем же `transferId`), явные короткие транзакции, фоновое добивание `PENDING`, Compose и документация. Тесты написаны вместе с этапами.
-- [x] `mvn -pl transfer-service -am verify` зелёный до этапа 10 включительно (подтвердил автор)
+- [x] `mvn verify` зелёный, ручная проверка transfer-service по чек-листу из README пройдена (IDE и контейнер, добив `PENDING` после остановки и запуска account-service) (подтвердил автор)
 
-Не подтверждено автором (ИИ не запускал сборку и тесты):
-- [ ] `mvn verify` после этапа 11 (фоновое добивание), этап 12 — только Compose и документация
-- [ ] Ручной запуск transfer-service по чек-листу из README (IDE и контейнер, `docker compose --profile apps up -d --build`), в том числе добив `PENDING` после остановки и запуска account-service
-- [ ] Права на `keys/public.pem` для контейнера transfer-service на Linux
+- [x] transfer-service: outbox и публикация в Kafka (этапы 1–5 задачи outbox): запись события в транзакции финализации, publisher с `SKIP LOCKED`, продюсер с ограниченными таймаутами, флаг `OUTBOX_ENABLED`, Compose и документация. Тесты написаны вместе с этапами.
 
-Не сделано: notification-service (бизнес-логика), outbox и публикация в Kafka (в том числе `spring-kafka` и тесты на Kafka через Testcontainers), лимиты переводов на пользователя на Redis, метрики, нагрузочные тесты, Kubernetes.
+- [x] `mvn verify` зелёный после задачи outbox, включая тесты на Kafka-контейнере Testcontainers; ручная проверка по чек-листу «Ручная проверка outbox и Kafka» из README пройдена, включая живой планировщик и недоступную Kafka (подтвердил автор)
+
+Не сделано: notification-service (бизнес-логика), лимиты переводов на пользователя на Redis, метрики, нагрузочные тесты, Kubernetes.
 
 ## 9. Следующие шаги (по порядку)
 
 1. ~~account-service без аутентификации~~ — реализовано (см. «Статус»).
 2. ~~JWT в account-service~~ — реализовано (см. «JWT»);
 3. ~~transfer-service~~ — реализовано (см. «Статус» и «transfer-service: API и поведение»).
-4. Outbox + Kafka producer в transfer-service (событие в `outbox_events` в транзакции финализации, publisher `@Scheduled` с `SKIP LOCKED`), notification-service с consumer и защитой от дублей; `spring-kafka` и тесты на Kafka через Testcontainers.
-4а. После outbox и Kafka: лимиты переводов на пользователя в transfer-service с возвращением Redis (счётчики, rate limiting; решение 29).
-5. Метрики, нагрузочный тест с цифрами в README (размер пула и `lock_timeout` — параметры для подбора), затем манифесты Kubernetes (kind) и по желанию Elasticsearch для поиска по истории.
+4. ~~Outbox + Kafka producer в transfer-service~~ — реализовано (см. «transfer-service: outbox и публикация в Kafka»).
+5. **notification-service**: consumer на `transfers.events.v1` (заголовок `event-id`, поле `eventId` в теле), защита от дублей по `event_id`, сохранение уведомлений; retry с задержкой и DLQ в Kafka для сообщений, которые не удалось обработать; тесты на Kafka через Testcontainers (`KafkaTestConfig` можно переиспользовать по образцу). Перед началом решить, выносить ли имя заголовка `event-id` в `events-contract`.
+
+Возможные дальнейшие улучшения:
+
+- Лимиты переводов на пользователя в transfer-service с возвращением Redis (счётчики, rate limiting; решение 29, которое придётся обновить). Правила (что считается, окно, поведение при недоступном Redis) описать до начала.
+- Метрики (Micrometer, `/actuator/prometheus`), при желании дашборд в Grafana.
+- Нагрузочный тест (k6 или Gatling) с цифрами в README: размер пула и `lock_timeout` — параметры для подбора. Лимиты на время теста отключаются или поднимаются, иначе они ограничат саму нагрузку. После изменений записи (например, ledger) тест перезапускается и цифры обновляются.
+- Кэш баланса в Redis для `GET` баланса в account-service: сброс после коммита, сравнение замеров до и после (нужен нагрузочный тест).
+- Двойная запись (ledger) в account-service: таблица проводок пишется в той же транзакции, баланс остаётся материализованным столбцом, тест сверки (сумма проводок равна балансу).
+- Возврат перевода (`POST /transfers/{id}/reversal`): компенсирующие проводки, новый статус и событие (после ledger).
+- Комиссии: отдельная проводка на счёт комиссий (после ledger).
+- Выписка за период с фильтрами и описание операции; поиск по описанию средствами Postgres (`tsvector`, GIN).
+- Конвертация валют по курсу из таблицы (после ledger).
+- Холд и подтверждение (резервирование суммы, затем capture или release).
+- Kubernetes (kind): манифесты (Kustomize) лежат рядом с Compose и не заменяют его; две реплики transfer-service показывают безопасность outbox и добивания при нескольких экземплярах. Делается последним, когда набор компонентов окончателен.
 
 ### Открытые вопросы
 
@@ -263,3 +285,6 @@ transfers-springboot/
 - ~~Нужен ли `GET /internal/transfers/{id}` для добивания `PENDING`~~ — нет, повторный `POST` с тем же `transferId` безопасен и используется.
 - Как защитить фоновое добивание от постоянно «отравленных» переводов (стабильный 502 вытесняет новые из партии): сейчас принято как ограничение, возможное решение — счётчик попыток или порядок по времени последней попытки.
 - Замена общего секрета на сервисный JWT, если понадобится.
+- Блокировка очереди outbox «ядовитым» событием (проход обрывается на первой ошибке, выборка от самых старых): нужен счётчик попыток или DLQ.
+- Очистка опубликованных строк `outbox_events` (по `published_at`).
+- Вынести имя заголовка `event-id` в `events-contract` (сейчас константа в `OutboxPublisher`): добавление константы не меняет формат событий, но это общий контракт с потребителем.

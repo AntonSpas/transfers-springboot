@@ -39,7 +39,7 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
         </dependency>
-        <!-- Kafka и events-contract нужны в следующей задаче (outbox), пока остаются -->
+        <!-- Kafka: продюсер outbox-publisher; events-contract: типы событий и имена топика и заголовков -->
         <dependency>
             <groupId>org.springframework.kafka</groupId>
             <artifactId>spring-kafka</artifactId>
@@ -92,6 +92,12 @@
         <dependency>
             <groupId>org.testcontainers</groupId>
             <artifactId>postgresql</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- Kafka для тестов публикации outbox (org.testcontainers.kafka.KafkaContainer, образ apache/kafka) -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>kafka</artifactId>
             <scope>test</scope>
         </dependency>
 

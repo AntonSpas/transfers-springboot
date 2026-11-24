@@ -19,6 +19,20 @@ spring:
     password: ${SPRING_DATASOURCE_PASSWORD:transfer_dev_password}
   kafka:
     bootstrap-servers: ${SPRING_KAFKA_BOOTSTRAP_SERVERS:localhost:29092}
+    # Продюсер outbox-publisher. Таймауты заданы явно, чтобы недоступный брокер не вешал проход на минуты
+    # (по умолчанию max.block.ms = 60s, delivery.timeout.ms = 120s).
+    producer:
+      acks: all
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      properties:
+        enable.idempotence: true
+        # Должно выполняться: delivery.timeout.ms >= request.timeout.ms + linger.ms (иначе продюсер не создастся).
+        linger.ms: 5
+        request.timeout.ms: 3000
+        delivery.timeout.ms: 5000
+        # Сколько send() может ждать метаданные топика при недоступном брокере.
+        max.block.ms: 3000
   jpa:
     open-in-view: false
     hibernate:
@@ -52,6 +66,18 @@ app:
     min-age: 60s
     # Сколько переводов берём за один запуск (самые старые первыми).
     batch-size: 50
+
+  # Публикация событий из outbox_events в Kafka (at-least-once)
+  outbox:
+    # Выключатель: false отключает планировщик и создание топика (сам код остаётся). По умолчанию включено.
+    enabled: ${OUTBOX_ENABLED:true}
+    # Пауза между проходами (отсчёт от конца предыдущего, проходы не накладываются).
+    interval: 1s
+    # Сколько событий берём за один проход (самые старые первыми).
+    batch-size: 100
+    # Сколько ждём подтверждения Kafka по одному событию. Держать не больше delivery.timeout.ms продюсера:
+    # тогда событие, по которому ожидание истекло, обычно и не доставлено.
+    send-timeout: 5s
 
 # Внутренние вызовы account-service (POST /internal/transfers)
 account-service:

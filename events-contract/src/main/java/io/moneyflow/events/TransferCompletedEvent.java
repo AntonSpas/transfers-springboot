@@ -15,6 +15,9 @@ import java.util.UUID;
  * @param amount        сумма (положительная)
  * @param currency      код валюты ISO 4217, например RUB
  * @param occurredAt    момент завершения перевода
+ * @param toOwnerId     владелец счёта зачисления (кого уведомить о поступлении). Необязательное поле, добавленное
+ *                      позже (решение 9: контракт только расширяется): в событиях, записанных до его появления,
+ *                      оно отсутствует, и консьюмер читает его как {@code null}
  */
 public record TransferCompletedEvent(
         UUID eventId,
@@ -24,5 +27,6 @@ public record TransferCompletedEvent(
         UUID toAccountId,
         BigDecimal amount,
         String currency,
-        Instant occurredAt) {
+        Instant occurredAt,
+        UUID toOwnerId) {
 }

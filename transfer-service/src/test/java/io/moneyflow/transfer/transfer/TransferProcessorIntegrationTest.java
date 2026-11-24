@@ -4,6 +4,7 @@ import com.zaxxer.hikari.HikariDataSource;
 import io.moneyflow.transfer.client.AccountCallResult;
 import io.moneyflow.transfer.client.AccountServiceClient;
 import io.moneyflow.transfer.client.InternalTransferResult;
+import io.moneyflow.transfer.outbox.OutboxWriter;
 import io.moneyflow.transfer.support.IntegrationTestBase;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -47,6 +48,9 @@ class TransferProcessorIntegrationTest extends IntegrationTestBase {
     private DataSource dataSource;
 
     @Autowired
+    private OutboxWriter outboxWriter;
+
+    @Autowired
     private TransferProcessor wiredProcessor;
 
     private AccountServiceClient client;
@@ -55,7 +59,7 @@ class TransferProcessorIntegrationTest extends IntegrationTestBase {
     @BeforeEach
     void setUp() {
         client = mock(AccountServiceClient.class);
-        processor = new TransferProcessor(repository, client, txManager, Clock.systemUTC());
+        processor = new TransferProcessor(repository, client, outboxWriter, txManager, Clock.systemUTC());
     }
 
     private Transfer create() {
@@ -194,7 +198,7 @@ class TransferProcessorIntegrationTest extends IntegrationTestBase {
     void twoInstancesFinalizingTheSameTransferSetTheStatusOnce() throws Exception {
         Transfer t = create();
         // второй экземпляр сервиса: свои блокировки в памяти, поэтому оба доходят до вызова account-service
-        TransferProcessor otherInstance = new TransferProcessor(repository, client, txManager, Clock.systemUTC());
+        TransferProcessor otherInstance = new TransferProcessor(repository, client, outboxWriter, txManager, Clock.systemUTC());
         // оба обработчика успевают прочитать PENDING и дойти до вызова, и только потом финализируют
         CyclicBarrier bothCalling = new CyclicBarrier(2);
         when(client.transfer(any())).thenAnswer(invocation -> {

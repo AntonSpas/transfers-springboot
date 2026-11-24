@@ -3,6 +3,7 @@ package io.moneyflow.transfer.transfer;
 import io.moneyflow.transfer.client.AccountCallResult;
 import io.moneyflow.transfer.client.AccountServiceClient;
 import io.moneyflow.transfer.client.InternalTransferRequest;
+import io.moneyflow.transfer.outbox.OutboxWriter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -25,7 +26,8 @@ import java.util.UUID;
  * <ol>
  *   <li>{@link #createPending}: короткая транзакция с вставкой {@code PENDING};</li>
  *   <li>{@link #process}: чтение без блокировки, вызов account-service вне транзакции,
- *       затем отдельная короткая транзакция: блокировка строки и переход {@code PENDING → COMPLETED/FAILED}.</li>
+ *       затем отдельная короткая транзакция: блокировка строки, переход {@code PENDING → COMPLETED/FAILED}
+ *       и запись события в outbox (в той же транзакции, только если переход реально произошёл).</li>
  * </ol>
  * Сбой между вызовом и записью статуса закрывается повтором {@link #process} для того же {@code transferId}:
  * account-service идемпотентен, а переход состояния разрешён только из {@code PENDING}.
@@ -42,14 +44,16 @@ public class TransferProcessor {
 
     private final TransferRepository repository;
     private final AccountServiceClient accountClient;
+    private final OutboxWriter outbox;
     private final TransactionTemplate tx;
     private final Clock clock;
     private final KeyedLock locks = new KeyedLock();
 
-    public TransferProcessor(TransferRepository repository, AccountServiceClient accountClient,
+    public TransferProcessor(TransferRepository repository, AccountServiceClient accountClient, OutboxWriter outbox,
                              PlatformTransactionManager transactionManager, Clock clock) {
         this.repository = repository;
         this.accountClient = accountClient;
+        this.outbox = outbox;
         this.tx = new TransactionTemplate(transactionManager);
         this.clock = clock;
     }
@@ -90,8 +94,10 @@ public class TransferProcessor {
         AccountCallResult call = accountClient.transfer(toRequest(current));
 
         return switch (call) {
-            case AccountCallResult.Completed completed -> finalizeTransfer(transferId, TransferStatus.COMPLETED, null);
-            case AccountCallResult.Rejected rejected -> finalizeTransfer(transferId, TransferStatus.FAILED, rejected.reason());
+            case AccountCallResult.Completed(var result) ->
+                    finalizeTransfer(transferId, TransferStatus.COMPLETED, null, result.toOwnerId());
+            case AccountCallResult.Rejected rejected ->
+                    finalizeTransfer(transferId, TransferStatus.FAILED, rejected.reason(), null);
             case AccountCallResult.Unavailable unavailable ->
                     new ProcessingResult(current, ProcessingResult.Outcome.PENDING_UNAVAILABLE);
             case AccountCallResult.UpstreamError error ->
@@ -103,14 +109,26 @@ public class TransferProcessor {
      * Короткая транзакция: блокировка строки и переход состояния. Блокировка нужна, чтобы запрос клиента
      * и фоновое добивание, обработавшие один перевод одновременно (в том числе на разных экземплярах сервиса),
      * не выставили статус дважды. Если перевод уже финальный, он остаётся как есть.
+     *
+     * <p>Событие для outbox пишется в этой же транзакции и только при {@code applied == true}: откат отменяет и статус,
+     * и событие, а второй обработчик (гонка запроса клиента и фонового добивания, два экземпляра) события не пишет.
+     * Так на перевод приходится ровно одно событие.
+     *
+     * @param toOwnerId владелец счёта зачисления из ответа account-service (только для {@code COMPLETED}, иначе {@code null})
      */
-    private ProcessingResult finalizeTransfer(UUID transferId, TransferStatus target, String reason) {
+    private ProcessingResult finalizeTransfer(UUID transferId, TransferStatus target, String reason, UUID toOwnerId) {
         Transfer result = Objects.requireNonNull(tx.execute(status -> {
             Transfer locked = repository.findByIdForUpdate(transferId)
                     .orElseThrow(() -> new IllegalStateException("Transfer not found: " + transferId));
             Instant now = now();
             boolean applied = target == TransferStatus.COMPLETED ? locked.complete(now) : locked.fail(reason, now);
-            if (!applied && locked.getStatus() != target) {
+            if (applied) {
+                if (target == TransferStatus.COMPLETED) {
+                    outbox.writeTransferCompleted(locked, toOwnerId, now);
+                } else {
+                    outbox.writeTransferFailed(locked, now);
+                }
+            } else if (locked.getStatus() != target) {
                 // account-service идемпотентен, поэтому такого быть не должно: заслуживает расследования
                 log.error("Transfer {} is already {} but account-service answered {}; keeping the stored status",
                         transferId, locked.getStatus(), target);
