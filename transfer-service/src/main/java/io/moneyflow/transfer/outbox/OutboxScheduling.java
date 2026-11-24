@@ -1,0 +1,49 @@
+package io.moneyflow.transfer.outbox;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.scheduling.annotation.EnableScheduling;
+import org.springframework.scheduling.annotation.SchedulingConfigurer;
+import org.springframework.scheduling.config.IntervalTask;
+import org.springframework.scheduling.config.ScheduledTaskRegistrar;
+
+/**
+ * Включает планировщик и регистрирует периодический проход {@link OutboxPublisher} только при
+ * {@code app.outbox.enabled=true}. Пауза считается от конца предыдущего прохода, поэтому проходы внутри одного
+ * экземпляра не накладываются. Интервал задаётся {@link java.time.Duration}, а не строкой в аннотации:
+ * так формат значения проверяет привязка свойств.
+ */
+@Configuration(proxyBeanMethods = false)
+@EnableScheduling
+@ConditionalOnProperty(prefix = "app.outbox", name = "enabled", havingValue = "true", matchIfMissing = true)
+public class OutboxScheduling implements SchedulingConfigurer {
+
+    private static final Logger log = LoggerFactory.getLogger(OutboxScheduling.class);
+
+    private final OutboxPublisher publisher;
+    private final OutboxProperties properties;
+
+    public OutboxScheduling(OutboxPublisher publisher, OutboxProperties properties) {
+        this.publisher = publisher;
+        this.properties = properties;
+    }
+
+    @Override
+    public void configureTasks(ScheduledTaskRegistrar registrar) {
+        registrar.addFixedDelayTask(new IntervalTask(this::runSafely, properties.interval(), properties.interval()));
+    }
+
+    /**
+     * Исключение не должно выходить наружу: следующий проход всё равно произойдёт, а причина попадёт в лог
+     * (ошибки Kafka {@link OutboxPublisher} обрабатывает сам, сюда доходят в основном сбои базы данных).
+     */
+    void runSafely() {
+        try {
+            publisher.runOnce();
+        } catch (RuntimeException e) {
+            log.error("Outbox publish run failed", e);
+        }
+    }
+}

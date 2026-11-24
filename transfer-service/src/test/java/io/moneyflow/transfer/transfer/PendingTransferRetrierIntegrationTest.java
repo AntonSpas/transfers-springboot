@@ -4,6 +4,7 @@ import io.moneyflow.transfer.client.AccountCallResult;
 import io.moneyflow.transfer.client.AccountServiceClient;
 import io.moneyflow.transfer.client.InternalTransferRequest;
 import io.moneyflow.transfer.client.InternalTransferResult;
+import io.moneyflow.transfer.outbox.OutboxWriter;
 import io.moneyflow.transfer.support.IntegrationTestBase;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -51,6 +52,9 @@ class PendingTransferRetrierIntegrationTest extends IntegrationTestBase {
     @Autowired
     private JdbcTemplate jdbc;
 
+    @Autowired
+    private OutboxWriter outboxWriter;
+
     private AccountServiceClient client;
     private TransferProcessor processor;
     private PendingTransferRetrier retrier;
@@ -60,7 +64,7 @@ class PendingTransferRetrierIntegrationTest extends IntegrationTestBase {
         // зависшие PENDING от прошлых тестов этого класса не должны попадать в выборку
         jdbc.update("delete from transfers where status = 'PENDING' and created_at < now() - interval '5 minutes'");
         client = mock(AccountServiceClient.class);
-        processor = new TransferProcessor(repository, client, txManager, Clock.systemUTC());
+        processor = new TransferProcessor(repository, client, outboxWriter, txManager, Clock.systemUTC());
         retrier = retrier(50);
     }
 

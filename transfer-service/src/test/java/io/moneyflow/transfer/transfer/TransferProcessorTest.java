@@ -4,6 +4,7 @@ import io.moneyflow.transfer.client.AccountCallResult;
 import io.moneyflow.transfer.client.AccountServiceClient;
 import io.moneyflow.transfer.client.InternalTransferRequest;
 import io.moneyflow.transfer.client.InternalTransferResult;
+import io.moneyflow.transfer.outbox.OutboxWriter;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -23,9 +24,11 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 /**
@@ -40,15 +43,17 @@ class TransferProcessorTest {
 
     private final TransferRepository repository = mock(TransferRepository.class);
     private final AccountServiceClient client = mock(AccountServiceClient.class);
+    private final OutboxWriter outbox = mock(OutboxWriter.class);
     private final TrackingTxManager txManager = new TrackingTxManager();
     private final Clock clock = Clock.fixed(NOW, ZoneOffset.UTC);
 
     private TransferProcessor processor;
     private Transfer transfer;
+    private final UUID toOwner = UUID.randomUUID();
 
     @BeforeEach
     void setUp() {
-        processor = new TransferProcessor(repository, client, txManager, clock);
+        processor = new TransferProcessor(repository, client, outbox, txManager, clock);
         transfer = pendingTransfer();
         when(repository.findById(transfer.getId())).thenReturn(Optional.of(transfer));
         when(repository.findByIdForUpdate(transfer.getId())).thenReturn(Optional.of(transfer));
@@ -61,7 +66,7 @@ class TransferProcessorTest {
 
     private AccountCallResult.Completed completed() {
         return new AccountCallResult.Completed(new InternalTransferResult(transfer.getId(),
-                transfer.getInitiatorId(), UUID.randomUUID()));
+                transfer.getInitiatorId(), toOwner));
     }
 
     // ---------- успешные и отказные исходы ----------
@@ -250,6 +255,96 @@ class TransferProcessorTest {
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining(unknown.toString());
         verify(client, never()).transfer(any());
+    }
+
+    // ---------- события outbox ----------
+
+    @Test
+    void completedTransitionWritesTheEventInsideTheFinalizationTransaction() {
+        when(client.transfer(any())).thenReturn(completed());
+        when(outbox.writeTransferCompleted(any(), any(), any())).thenAnswer(invocation -> {
+            assertThat(txManager.active).as("запись события вне транзакции финализации").isTrue();
+            return UUID.randomUUID();
+        });
+
+        processor.process(transfer.getId());
+
+        verify(outbox).writeTransferCompleted(transfer, toOwner, NOW_MICROS);
+        verify(outbox, never()).writeTransferFailed(any(), any());
+    }
+
+    @Test
+    void rejectedTransitionWritesTheFailedEvent() {
+        when(client.transfer(any())).thenReturn(new AccountCallResult.Rejected("INSUFFICIENT_FUNDS"));
+        when(outbox.writeTransferFailed(any(), any())).thenAnswer(invocation -> {
+            assertThat(txManager.active).as("запись события вне транзакции финализации").isTrue();
+            return UUID.randomUUID();
+        });
+
+        processor.process(transfer.getId());
+
+        verify(outbox).writeTransferFailed(transfer, NOW_MICROS);
+        verify(outbox, never()).writeTransferCompleted(any(), any(), any());
+    }
+
+    @Test
+    void pendingOutcomesWriteNoEvents() {
+        when(client.transfer(any())).thenReturn(
+                new AccountCallResult.Unavailable("HTTP 503"),
+                new AccountCallResult.UpstreamError("HTTP 401 UNAUTHORIZED"));
+
+        processor.process(transfer.getId());
+        processor.process(transfer.getId());
+
+        verifyNoInteractions(outbox);
+    }
+
+    @Test
+    void alreadyFinalTransferWritesNoEvent() {
+        transfer.complete(CREATED.plusSeconds(1));
+
+        processor.process(transfer.getId());
+
+        verifyNoInteractions(outbox);
+    }
+
+    @Test
+    void transferFinalizedByAnotherProcessorWhileCallingWritesNoEvent() {
+        // второй обработчик видит финальный статус под блокировкой: перехода нет, события нет
+        Transfer lockedAlreadyDone = Transfer.createPending(transfer.getId(), "key-1", transfer.getInitiatorId(),
+                transfer.getFromAccountId(), transfer.getToAccountId(), new BigDecimal("10.5000"), "USD", CREATED);
+        lockedAlreadyDone.complete(CREATED.plusSeconds(2));
+        when(repository.findByIdForUpdate(transfer.getId())).thenReturn(Optional.of(lockedAlreadyDone));
+        when(client.transfer(any())).thenReturn(completed());
+
+        processor.process(transfer.getId());
+
+        verifyNoInteractions(outbox);
+    }
+
+    @Test
+    void conflictingAnswerForAFinalTransferWritesNoEvent() {
+        Transfer lockedAlreadyDone = Transfer.createPending(transfer.getId(), "key-1", transfer.getInitiatorId(),
+                transfer.getFromAccountId(), transfer.getToAccountId(), new BigDecimal("10.5000"), "USD", CREATED);
+        lockedAlreadyDone.complete(CREATED.plusSeconds(2));
+        when(repository.findByIdForUpdate(transfer.getId())).thenReturn(Optional.of(lockedAlreadyDone));
+        when(client.transfer(any())).thenReturn(new AccountCallResult.Rejected("FORBIDDEN"));
+
+        processor.process(transfer.getId());
+
+        verifyNoInteractions(outbox);
+    }
+
+    @Test
+    void failureOfTheEventWriteAbortsTheFinalizationTransaction() {
+        when(client.transfer(any())).thenReturn(completed());
+        doThrow(new IllegalStateException("outbox down")).when(outbox).writeTransferCompleted(any(), any(), any());
+
+        assertThatThrownBy(() -> processor.process(transfer.getId()))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("outbox down");
+
+        assertThat(txManager.committed).as("транзакция не должна закоммититься").isZero();
     }
 
     // ---------- создание ----------

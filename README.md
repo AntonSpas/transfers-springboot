@@ -20,7 +20,7 @@
 | `notification-service` | потребление событий, создание уведомлений | `notification_db` | 8083 |
 | `events-contract` | общий контракт событий Kafka (только records и константы) | — | — |
 
-Инфраструктура: PostgreSQL 17 (один контейнер, три базы, у каждого сервиса своя роль и доступ только к своей базе), Apache Kafka 4.1 (KRaft), Redis 8. transfer-service Redis не использует; он понадобится позже для лимитов переводов на пользователя (после outbox и Kafka).
+Инфраструктура: PostgreSQL 17 (один контейнер, три базы, у каждого сервиса своя роль и доступ только к своей базе), Apache Kafka 4.1 (KRaft), Redis 8. transfer-service Redis не использует; он понадобится позже для лимитов переводов на пользователя.
 
 ## Требования
 
@@ -36,7 +36,8 @@ Java 21, Maven 3.9+, Docker (с Compose v2).
 #    чтобы переопределить пароли: cp .env.example .env
 docker compose up -d
 
-# 2. Сборка и тесты (Testcontainers поднимает свой PostgreSQL, нужен запущенный Docker)
+# 2. Сборка и тесты (Testcontainers поднимает свой PostgreSQL и Kafka, нужен запущенный Docker;
+#    образ apache/kafka:4.1.1 скачивается при первом запуске тестов transfer-service)
 mvn verify
 
 # 3a. Сервисы из IDE: запустите *Application классы (порты 8081/8082/8083 заданы по умолчанию).
@@ -106,7 +107,7 @@ curl -s -X POST localhost:8081/accounts -H "Authorization: Bearer $TOKEN" -H 'Co
 
 ## transfer-service
 
-Публичное API переводов. Проверяет JWT только по **публичному** ключу, хранит переводы и статусы, вызывает account-service (`POST /internal/transfers`), добивает зависшие переводы. Все эндпоинты, кроме health и prometheus, требуют `Authorization: Bearer <token>` (токен выдаёт account-service). Инициатор перевода это `sub` токена, в теле запроса его нет.
+Публичное API переводов. Проверяет JWT только по **публичному** ключу, хранит переводы и статусы, вызывает account-service (`POST /internal/transfers`), добивает зависшие переводы, пишет события в outbox и публикует их в Kafka. Все эндпоинты, кроме health и prometheus, требуют `Authorization: Bearer <token>` (токен выдаёт account-service). Инициатор перевода это `sub` токена, в теле запроса его нет.
 
 | Метод и путь | Назначение |
 |---|---|
@@ -134,9 +135,11 @@ curl -s -X POST localhost:8081/accounts -H "Authorization: Bearer $TOKEN" -H 'Co
 
 Как устроена обработка: перевод вставляется в `PENDING` короткой транзакцией, вызов account-service идёт **вне транзакции** (с таймаутами и повтором с тем же `transferId`), затем короткая транзакция ставит `COMPLETED` или `FAILED`, и только из `PENDING`. Если account-service недоступен, перевод остаётся `PENDING`, и раз в `interval` фоновая задача (`@Scheduled`, `FOR UPDATE SKIP LOCKED`) дообрабатывает переводы старше `min-age`. account-service идемпотентен по `transferId`, поэтому повторы не двигают деньги дважды.
 
-Переменные окружения: `SERVER_PORT` (по умолчанию 8082), `JWT_PUBLIC_KEY_PATH` (без значения по умолчанию: без ключа сервис не стартует), `INTERNAL_API_TOKEN` (тот же секрет, что у account-service; по умолчанию `internal_dev_token`, пустое значение останавливает старт), `ACCOUNT_SERVICE_URL` (по умолчанию `http://localhost:8081`), `PENDING_RETRY_ENABLED` (по умолчанию `true`). Таймауты, число попыток и параметры добивания (`app.pending-retry.interval`, `min-age`, `batch-size`) лежат в `application.yml`.
+Переменные окружения: `SERVER_PORT` (по умолчанию 8082), `JWT_PUBLIC_KEY_PATH` (без значения по умолчанию: без ключа сервис не стартует), `INTERNAL_API_TOKEN` (тот же секрет, что у account-service; по умолчанию `internal_dev_token`, пустое значение останавливает старт), `ACCOUNT_SERVICE_URL` (по умолчанию `http://localhost:8081`), `PENDING_RETRY_ENABLED` (по умолчанию `true`), `OUTBOX_ENABLED` (по умолчанию `true`), `SPRING_KAFKA_BOOTSTRAP_SERVERS` (по умолчанию `localhost:29092`, в Compose `kafka:9092`). Таймауты, число попыток и параметры добивания (`app.pending-retry.interval`, `min-age`, `batch-size`), параметры публикации (`app.outbox.interval`, `batch-size`, `send-timeout`) и настройки продюсера Kafka лежат в `application.yml`.
 
-Redis сервису пока не нужен: он вернётся позже для лимитов переводов на пользователя, после outbox и публикации в Kafka.
+Outbox и события: когда перевод получает финальный статус, в той же транзакции в таблицу `outbox_events` пишется событие (`TransferCompleted` или `TransferFailed`), и только если переход статуса реально произошёл (повторная обработка и гонка двух обработчиков события не дублируют). Отдельный проход раз в `app.outbox.interval` (по умолчанию 1 с) берёт неотправленные события (`FOR UPDATE SKIP LOCKED`, самые старые первыми, не больше `batch-size`), отправляет их в топик `transfers.events.v1` по порядку и ставит `published_at` после подтверждения брокера. Ключ сообщения это id перевода, заголовки: `event-type` (тип события) и `event-id` (уникальный id, по нему потребитель отбрасывает повторы). Доставка at-least-once: при сбое между отправкой и отметкой событие уйдёт повторно. Если брокер недоступен, сервис продолжает работать, события копятся в таблице и уходят после восстановления; проход обрывается на первой ошибке, чтобы не нарушать порядок. `OUTBOX_ENABLED=false` отключает публикацию (и создание топика), запись в `outbox_events` при этом продолжается. Причины решений: `docs/decisions.md`, пункты 38–45.
+
+Redis сервису пока не нужен: он вернётся позже для лимитов переводов на пользователя.
 
 ### Ручная проверка transfer-service
 
@@ -162,11 +165,35 @@ curl -i -X POST localhost:8082/transfers -H "Authorization: Bearer $A" -H 'Conte
 #    в течение min-age + interval (около 1,5 минут) статус станет COMPLETED, это видно по GET
 ```
 
+### Ручная проверка outbox и Kafka
+
+Нужны Postgres, Kafka и account-service (см. выше) и запущенный transfer-service; сделайте перевод из предыдущего чек-листа. Команды для Compose:
+
+```bash
+# события в outbox: у свежего перевода published_at заполняется примерно через секунду
+docker compose exec postgres psql -U postgres -d transfer_db \
+  -c "select type, created_at, published_at from outbox_events order by created_at desc limit 5"
+
+# что лежит в топике: ключ = id перевода, заголовки event-type и event-id, значение = JSON события
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+  --topic transfers.events.v1 --from-beginning --timeout-ms 10000 \
+  --property print.key=true --property print.headers=true
+```
+
+1. Успешный перевод: в топике `TransferCompleted` с `toOwnerId` (владелец счёта получателя); перевод с `amount` больше баланса: `TransferFailed` с `reason` `INSUFFICIENT_FUNDS`.
+2. Повтор запроса с тем же `Idempotency-Key` (ответ 200) и повторный `GET` новых событий не создают: событие одно на перевод.
+3. Перевод в `PENDING` (account-service остановлен, ответ 202) события не создаёт; оно появится, когда фоновое добивание доведёт перевод до `COMPLETED` или `FAILED`.
+4. Kafka недоступна: `docker compose stop kafka`, сделайте перевод: ответ 201, в `outbox_events` у события `published_at` пустой, в логе transfer-service примерно раз в секунду предупреждение `Outbox event ... not sent`. Затем `docker compose start kafka`: через несколько секунд `published_at` заполняется, событие появляется в топике. Если транспорт Kafka недоступен при старте transfer-service, запуск может ждать создания топика до 30 секунд, затем сервис продолжает работу (в этом случае ошибка создания топика попадёт в лог).
+5. `OUTBOX_ENABLED=false` (в `.env` или окружении сервиса) и перезапуск: переводы работают, события копятся в `outbox_events`; после возврата к `true` уходят все накопленные.
+
+Повторная доставка одного `event-id` допустима (at-least-once), поэтому потребитель обязан отбрасывать дубли по `event-id` (`eventId` в теле). Опубликованные строки из `outbox_events` автоматически не удаляются.
+
 ## events-contract
 
 Модуль без зависимостей и логики: записи событий (`TransferCompletedEvent`, `TransferFailedEvent`),
 имена топиков (`Topics`) и типы событий (`EventTypes`). Его подключают сервис-отправитель и сервис-получатель,
 поэтому они всегда одинаково понимают формат сообщения.
+`TransferCompletedEvent` содержит необязательное поле `toOwnerId` (владелец счёта получателя, чтобы его можно было уведомить); `TransferFailedEvent` владельцев не содержит, потому что account-service при отказе их не возвращает. Уведомление об отказе получает инициатор (`initiatorId`).
 
 Правила развития контракта:
 - добавлять только необязательные поля, существующие не переименовывать и не удалять;
@@ -185,7 +212,9 @@ curl -i -X POST localhost:8082/transfers -H "Authorization: Bearer $A" -H 'Conte
 - [x] account-service: счета, пополнение (идемпотентное), история, внутренний перевод, защита `/internal` общим секретом
 - [x] JWT-аутентификация в account-service: регистрация, вход, RS256, владение счетами, `initiatorId` во внутреннем переводе
 - [x] transfer-service: JWT по публичному ключу, идемпотентные переводы, вызов account-service с таймаутами и повтором, `GET /transfers/{id}`, фоновое добивание `PENDING`
-- [ ] Outbox и публикация в Kafka, notification-service
-- [ ] Нагрузочный тест, метрики, манифесты Kubernetes
+- [x] transfer-service: outbox (событие в транзакции финализации), публикация в Kafka (`transfers.events.v1`), тесты на Testcontainers с Kafka
+- [ ] notification-service: потребитель событий, защита от дублей, retry и DLQ
+
+Возможные дальнейшие улучшения: лимиты переводов на Redis, метрики и нагрузочный тест, кэш баланса, двойная запись (ledger), возврат перевода и комиссии, выписка с фильтрами, конвертация валют, холд и подтверждение, Kubernetes.
 
 Принятые решения: [docs/decisions.md](docs/decisions.md)

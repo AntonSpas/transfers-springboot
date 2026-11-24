@@ -18,8 +18,14 @@ import java.util.UUID;
  * <p>account-service подменён {@link AccountMock}; паузу между повторными попытками клиента обнуляем,
  * чтобы тесты на 503 не ждали. Фоновое добивание {@code PENDING} выключено: оно трогало бы переводы чужих тестов
  * и ходило бы в подмену account-service; сама логика проверяется вызовом {@code runOnce()} напрямую.
+ * Публикация outbox тоже выключена (планировщик и создание топика): в общем контексте нет брокера Kafka, и обращения к нему
+ * зависали бы на таймаутах. Работа с настоящим брокером проверяется отдельным контекстом Kafka-тестов.
  */
-@SpringBootTest(properties = {"account-service.retry-backoff=0ms", "app.pending-retry.enabled=false"})
+@SpringBootTest(properties = {
+        "account-service.retry-backoff=0ms",
+        "app.pending-retry.enabled=false",
+        "app.outbox.enabled=false"
+})
 @AutoConfigureMockMvc
 @Import({PostgresTestConfig.class, JwtTestConfig.class, AccountMockTestConfig.class})
 public abstract class IntegrationTestBase {
