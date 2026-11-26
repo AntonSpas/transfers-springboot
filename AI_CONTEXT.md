@@ -1,6 +1,6 @@
 # AI_CONTEXT — контекст проекта transfers-springboot
 
-Актуальность: на 2026-11-23, «transfer-service реализован полностью: JWT, переводы с идемпотентностью, фоновое добивание `PENDING`, outbox и публикация в Kafka; `mvn verify` и ручная проверка пройдены автором». После каждого этапа обновляйте разделы «Статус» и «Следующие шаги».
+Актуальность: на 2026-11-25, «все три сервиса реализованы: account-service, transfer-service (JWT, переводы с идемпотентностью, добивание `PENDING`, outbox и публикация в Kafka) и notification-service (потребитель `transfers.events.v1`, дедупликация, повторы и DLT, dispatcher); `mvn verify` зелёный после каждого этапа, ручная проверка notification-service по чек-листу README ещё не пройдена». После каждого этапа обновляйте разделы «Статус» и «Следующие шаги».
 
 ---
 
@@ -54,7 +54,7 @@
 
 - **account-service** — владелец балансов и проводок: атомарно выполняет списание и зачисление, проверяет баланс и владельца счёта. О Kafka не знает.
 - **transfer-service** — оркестратор: публичное API переводов, идемпотентность клиента, статус перевода, вызов account-service с таймаутами и повтором, фоновое добивание зависших `PENDING` (реализовано), outbox и публикация событий в Kafka (реализовано). Здесь же будут жить лимиты (в том числе на Redis), холды, проверки (опциональные расширения).
-- **notification-service** — потребитель событий, запись уведомлений.
+- **notification-service** — потребитель событий: по каждому событию ровно одно уведомление (дубли отсекает `UNIQUE (source_event_id)`), затем dispatcher «отправляет» его через заменяемый канал (заглушка с логом); необработанные сообщения после повторов уходят в DLT `transfers.events.v1.DLT`.
 
 Порядок одного перевода: проверить JWT → вставить `transfer` в статусе `PENDING` (при дубле ключа вернуть существующий) → вызвать account-service (вне транзакции БД) → в короткой транзакции выставить `COMPLETED`/`FAILED` и в той же транзакции записать событие в `outbox_events` (только при реальном переходе); отдельный проход publisher отправляет его в Kafka. Сбой между вызовом и записью статуса закрывается повтором того же `transferId`: account-service идемпотентен.
 
@@ -80,6 +80,7 @@
 12. **Защита `/internal/**` — общий секрет** в заголовке `X-Internal-Token` (переменная `INTERNAL_API_TOKEN`), отдельная цепочка безопасности; пользовательский JWT доступа к `/internal` не даёт. Путь развития — сервисный JWT.
 13. **transfer-service** (решения 29–37 в `docs/decisions.md`): JWT только по публичному ключу; явные короткие транзакции и вызов account-service вне транзакции; 4xx account-service 401/400/409 это 502 и `PENDING`, а не `FAILED`; идемпотентность клиента на уникальном индексе с перехватом нарушения; 404 раньше 403 и без обхода для ADMIN; фоновое добивание с `SKIP LOCKED` и флагом; Redis убран, вернётся для лимитов.
 14. **transfer-service: outbox и Kafka** (решения 38–45): событие пишется в транзакции финализации и только при реальном переходе (одно событие на перевод); `toOwnerId` добавлен в `TransferCompleted`; publisher выбирает и отправляет партию в одной транзакции с `SKIP LOCKED` (осознанное исключение из правила «внешний вызов вне транзакции»), при первой ошибке проход прекращается; продюсер с ограниченными таймаутами; флаг `OUTBOX_ENABLED`; DLQ и очистки опубликованных строк нет.
+15. **notification-service** (решения 46–56): получатель успеха — только `toOwnerId` (при `null` уведомления нет), неуспеха — `initiatorId`; дедупликация нативным `INSERT ... ON CONFLICT (source_event_id) DO NOTHING` (`processed_events` не используется); одно сообщение — одна транзакция, `ack-mode=RECORD`; тип события по заголовку `event-type`, String-десериализаторы; `EventParseException` и `NullPointerException` сразу в DLT, остальное — 3 повтора (1 с × 2, максимум 10 с) и DLT; блокирующие повторы (партиция стоит ради порядка); dispatcher отправляет внутри транзакции под `SKIP LOCKED` (как решение 40, для реального канала пересмотреть), `FAILED` терминальный; выключатели `CONSUMER_ENABLED` и `DISPATCH_ENABLED`.
 
 ### Формат ошибок account-service
 
@@ -99,7 +100,7 @@
 
 account-service: создать счёт; пополнить; получить баланс; история операций (пагинация); внутренний атомарный перевод. **Реализовано.**
 transfer-service: `POST /transfers` (заголовок `Idempotency-Key`); `GET /transfers/{id}`.
-notification-service: потребление `TransferCompleted/Failed`, запись уведомления.
+notification-service: потребление `TransferCompleted/Failed`, запись уведомления (реализовано), отправка через канал (реализовано).
 Валидации и ошибки: недостаточно средств, счёт не найден, разные валюты, сумма ≤ 0; единый формат ошибок (`@RestControllerAdvice`).
 
 ### API account-service (реализовано)
@@ -176,7 +177,7 @@ transfers-springboot/
 ├── events-contract/                # Topics, EventTypes, TransferCompletedEvent, TransferFailedEvent
 ├── account-service/                # см. ниже
 ├── transfer-service/               # io.moneyflow.transfer: common, config, client, transfer, outbox; db/migration V1
-└── notification-service/           # io.moneyflow.notification, db/migration V1
+└── notification-service/           # io.moneyflow.notification: config, notification, consumer, dispatch; db/migration V1
 ```
 
 Пакеты по фичам. **account-service** (`io.moneyflow.account.*`):
@@ -201,10 +202,18 @@ transfers-springboot/
 
 Тесты account-service (`src/test`): `support/IntegrationTestBase` (`@Import` `PostgresTestConfig` + `JwtTestConfig`; один контейнер Postgres и один кэшированный контекст на прогон; помощники `bearer`, `expiredBearer`, `ownerBearer`, `ownerOf`); интеграционные — `AuthApiTest`, `AccountApiTest`, `AccountOwnershipTest`, `DepositAndHistoryTest`, `DepositIdempotencyTest`, `InternalTransferTest`, `InternalApiSecurityTest`, `JwtAuthenticationTest`, `SecurityConfigTest`, `PasswordEncoderConfigTest`, `JwtTokenServiceTest`, `LedgerImmutabilityTest`, `LockTimeoutTest` (свой контекст с `lock_timeout = 500ms`, отдельный контейнер); быстрые — `JwtKeyLoaderTest`, `CurrentUserTest`, `ApiErrorSecurityHandlerTest`, `DomainModelTest`, `GlobalExceptionHandlerTest`, `InternalApiTokenFilterTest`. Классы названы `*Test`, а не `*IT`: CI запускает `mvn verify` без Failsafe, `*IT` не выполнились бы. Проводки и аудит не очищаются (триггеры), тесты создают уникальные данные.
 
+**notification-service** (`io.moneyflow.notification.*`):
+- `config` — `ClockConfig`;
+- `notification` — `Notification` (`Persistable`, без `@ManyToOne`), `NotificationType`, `NotificationStatus`, `NotificationRepository` (`insertIfAbsent` — нативный `ON CONFLICT DO NOTHING`, `lockNew` — `FOR UPDATE SKIP LOCKED`, оба `Propagation.MANDATORY`), `NotificationMessages` (тексты), `NotificationService` (`handle(...)` → `Outcome {CREATED, DUPLICATE, NO_RECIPIENT}`);
+- `consumer` — `TransferEventsListener` (`@KafkaListener`, `autoStartup` от `app.consumer.enabled`), `TransferEventParser`, `ParsedEvent`, `EventParseException`, `ErrorClassification`, `ConsumerErrorHandlingConfig` (`DefaultErrorHandler`, `DeadLetterPublishingRecoverer`), `ConsumerTopicConfig` (`NewTopic` для DLT), `ConsumerProperties`, `ConsumerPropertiesConfig`;
+- `dispatch` — `NotificationChannel`, `LoggingNotificationChannel`, `NotificationDispatcher` (`runOnce()` → `Report(sent, failed)`), `DispatchScheduling`, `DispatchProperties`, `DispatchPropertiesConfig`.
+
+Тесты notification-service: `support/` (`IntegrationTestBase` с выключенными потребителем и dispatcher, `PostgresTestConfig`; `KafkaIntegrationTestBase` и `KafkaTestConfig` с `apache/kafka:4.1.1` и шпионами `@MockitoSpyBean`; `TestEvents`); быстрые: `NotificationMessagesTest`, `NotificationTest`, `ConsumerPropertiesTest`, `ErrorClassificationTest`, `TransferEventParserTest`, `TransferEventsListenerTest`, `ConsumerErrorHandlingConfigTest`, `DispatchPropertiesTest`, `DispatchSchedulingTest`, `LoggingNotificationChannelTest`; на PostgreSQL: `NotificationServiceApplicationTests`, `NotificationRepositoryTest`, `NotificationServiceTest`, `NotificationServiceClockTest`, `NotificationDispatcherTest`; на брокере: `TransferEventsKafkaIntegrationTest`.
+
 ## 7. Конфигурация и запуск
 
 - `application.yml` каждого сервиса (в `src/main/resources/`) читает значения из переменных окружения со значениями по умолчанию для локальной разработки (остаются по решению автора):
-  `SERVER_PORT`, `SPRING_DATASOURCE_URL/USERNAME/PASSWORD`, `SPRING_KAFKA_BOOTSTRAP_SERVERS`; **`INTERNAL_API_TOKEN`** (по умолчанию `internal_dev_token`; пустое значение останавливает старт) нужен и account-service (проверяет), и transfer-service (отправляет), значение должно совпадать. transfer-service дополнительно: `ACCOUNT_SERVICE_URL` (по умолчанию `http://localhost:8081`, в Compose `http://account-service:8080`), `PENDING_RETRY_ENABLED` (по умолчанию `true`), `OUTBOX_ENABLED` (по умолчанию `true`); `SPRING_DATA_REDIS_*` ему не нужны. В Compose и `.env.example` переменные есть.
+  `SERVER_PORT`, `SPRING_DATASOURCE_URL/USERNAME/PASSWORD`, `SPRING_KAFKA_BOOTSTRAP_SERVERS`; **`INTERNAL_API_TOKEN`** (по умолчанию `internal_dev_token`; пустое значение останавливает старт) нужен и account-service (проверяет), и transfer-service (отправляет), значение должно совпадать. transfer-service дополнительно: `ACCOUNT_SERVICE_URL` (по умолчанию `http://localhost:8081`, в Compose `http://account-service:8080`), `PENDING_RETRY_ENABLED` (по умолчанию `true`), `OUTBOX_ENABLED` (по умолчанию `true`); `SPRING_DATA_REDIS_*` ему не нужны. notification-service дополнительно: `CONSUMER_ENABLED` и `DISPATCH_ENABLED` (по умолчанию `true`; остальные параметры `app.consumer.*` и `app.dispatch.*` только в `application.yml`). В Compose и `.env.example` переменные есть.
   **`JWT_PRIVATE_KEY_PATH`, `JWT_PUBLIC_KEY_PATH`** — абсолютные пути к PEM-ключам, значений по умолчанию нет (старт без них падает); account-service нужны оба, transfer-service только `JWT_PUBLIC_KEY_PATH`. Для IDE/Maven лежат в `.env` (прямые слэши); `application.yml` подключает `.env` через `spring.config.import: optional:file:.env[.properties]` (и `../.env`). В Docker пути фиксированы в `docker-compose.yml` (`/keys/...`), хостовые из `.env` в контейнер не попадают.
 - Пароли по умолчанию: `account_dev_password`, `transfer_dev_password`, `notification_dev_password`; админ Postgres `postgres_dev_password`. Переопределяются через `.env` (`ACCOUNT_DB_PASSWORD` и т. д.). Реальные секреты не коммитить.
 - Хостовые порты инфраструктуры: **Postgres 5433** (`POSTGRES_HOST_PORT`, чтобы не конфликтовать с локальным PostgreSQL на 5432), Kafka для IDE `localhost:29092`, внутри сети Docker `kafka:9092`, Redis 6379 (контейнер есть, transfer-service им не пользуется).
@@ -244,7 +253,7 @@ transfers-springboot/
 - [x] JWT в account-service (этапы 1–9 нового плана): ключи и загрузка, выдача токена, PasswordEncoder, регистрация/вход, ресурс-сервер с 401/403 в `ApiError`, владение счетами, история, `initiatorId` во внутреннем переводе, Compose/`.env.example`, документация; тесты написаны вместе с этапами
 
 - [x] `mvn verify` зелёный, account-service запускается с ключами из IDE/Maven и в контейнере (подтвердил автор)
-- [ ] Зелёный `mvn -B verify` в CI после пуша
+- [x] Зелёный `mvn -B verify` в CI после пуша
 
 - [x] transfer-service (этапы 1–12): JWT по публичному ключу, `POST /transfers` с идемпотентностью (201/200/202/409/422/502), `GET /transfers/{id}`, клиент account-service (таймауты, повтор с тем же `transferId`), явные короткие транзакции, фоновое добивание `PENDING`, Compose и документация. Тесты написаны вместе с этапами.
 - [x] `mvn verify` зелёный, ручная проверка transfer-service по чек-листу из README пройдена (IDE и контейнер, добив `PENDING` после остановки и запуска account-service) (подтвердил автор)
@@ -253,7 +262,11 @@ transfers-springboot/
 
 - [x] `mvn verify` зелёный после задачи outbox, включая тесты на Kafka-контейнере Testcontainers; ручная проверка по чек-листу «Ручная проверка outbox и Kafka» из README пройдена, включая живой планировщик и недоступную Kafka (подтвердил автор)
 
-Не сделано: notification-service (бизнес-логика), лимиты переводов на пользователя на Redis, метрики, нагрузочные тесты, Kubernetes.
+- [x] notification-service (этапы 1–5): основа и дедупликация, потребитель с повторами и DLT, dispatcher с заменяемым каналом, тесты на брокере Testcontainers, флаги `CONSUMER_ENABLED` и `DISPATCH_ENABLED`, Compose и документация. Тесты написаны вместе с этапами.
+- [x] `mvn verify` зелёный после каждого этапа 1–4 notification-service (подтвердил автор).
+- [x] Ручная проверка notification-service по чек-листу из README и `mvn verify`
+
+Не сделано: реальный канал отправки уведомлений (email, push), повторная отправка `FAILED`, разбор и повторная обработка сообщений из DLT, лимиты переводов на пользователя на Redis, метрики, нагрузочные тесты, Kubernetes.
 
 ## 9. Следующие шаги (по порядку)
 
@@ -261,7 +274,7 @@ transfers-springboot/
 2. ~~JWT в account-service~~ — реализовано (см. «JWT»);
 3. ~~transfer-service~~ — реализовано (см. «Статус» и «transfer-service: API и поведение»).
 4. ~~Outbox + Kafka producer в transfer-service~~ — реализовано (см. «transfer-service: outbox и публикация в Kafka»).
-5. **notification-service**: consumer на `transfers.events.v1` (заголовок `event-id`, поле `eventId` в теле), защита от дублей по `event_id`, сохранение уведомлений; retry с задержкой и DLQ в Kafka для сообщений, которые не удалось обработать; тесты на Kafka через Testcontainers (`KafkaTestConfig` можно переиспользовать по образцу). Перед началом решить, выносить ли имя заголовка `event-id` в `events-contract`.
+5. ~~notification-service~~ — реализовано (см. «Статус» и решения 46–56).
 
 Возможные дальнейшие улучшения:
 
@@ -287,4 +300,7 @@ transfers-springboot/
 - Замена общего секрета на сервисный JWT, если понадобится.
 - Блокировка очереди outbox «ядовитым» событием (проход обрывается на первой ошибке, выборка от самых старых): нужен счётчик попыток или DLQ.
 - Очистка опубликованных строк `outbox_events` (по `published_at`).
-- Вынести имя заголовка `event-id` в `events-contract` (сейчас константа в `OutboxPublisher`): добавление константы не меняет формат событий, но это общий контракт с потребителем.
+- Вынести имя заголовка `event-id` в `events-contract` (сейчас константа в `OutboxPublisher`): добавление константы не меняет формат событий, но это общий контракт с потребителем. Потребитель заголовок не читает: дедупликация идёт по `eventId` из тела.
+- Реальный канал уведомлений: схема «отправка внутри транзакции» (решение 54) для него не подходит, нужен промежуточный статус, таймауты и идемпотентность у провайдера.
+- Что делать с `FAILED` уведомлениями и сообщениями в DLT: сейчас только ручной разбор, автоматических повторов нет.
+- Неблокирующие retry-топики вместо блокировки партиции (решение 51), если задержки на временных ошибках станут проблемой.

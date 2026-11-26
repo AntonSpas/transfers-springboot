@@ -130,6 +130,12 @@ services:
       SPRING_DATASOURCE_USERNAME: notification_svc
       SPRING_DATASOURCE_PASSWORD: ${NOTIFICATION_DB_PASSWORD:-notification_dev_password}
       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      # Потребитель топика transfers.events.v1 (слушатель и создание топика transfers.events.v1.DLT); false отключает его,
+      # события при этом остаются в Kafka и обработаются после включения (повторы и паузы — в application.yml)
+      CONSUMER_ENABLED: ${CONSUMER_ENABLED:-true}
+      # Отправка уведомлений (dispatcher, канал-заглушка пишет в лог); false отключает её,
+      # уведомления при этом копятся в статусе NEW и уйдут после включения (интервал и размер партии — в application.yml)
+      DISPATCH_ENABLED: ${DISPATCH_ENABLED:-true}
 
 volumes:
   pgdata:

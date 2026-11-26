@@ -13,9 +13,30 @@ spring:
     password: ${SPRING_DATASOURCE_PASSWORD:notification_dev_password}
   kafka:
     bootstrap-servers: ${SPRING_KAFKA_BOOTSTRAP_SERVERS:localhost:29092}
+    # Ключ и значение читаем строками: класс события выбирается по заголовку event-type, JSON разбирает ObjectMapper
+    # (так битое сообщение не ломает сам консьюмер, а уходит в DLT как обычная неповторяемая ошибка).
     consumer:
       group-id: notification-service
       auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    listener:
+      # Смещение коммитится после обработки каждого сообщения (после успешной транзакции БД).
+      ack-mode: record
+      # По одному потоку на партицию топика (3 партиции). Порядок сохраняется внутри партиции, то есть внутри перевода.
+      concurrency: 3
+    # Продюсер нужен только для публикации в DLT. Таймауты заданы явно, чтобы недоступный брокер не вешал обработку
+    # на минуты (по умолчанию max.block.ms = 60s, delivery.timeout.ms = 120s).
+    producer:
+      acks: all
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      properties:
+        # Должно выполняться: delivery.timeout.ms >= request.timeout.ms + linger.ms (иначе продюсер не создастся).
+        request.timeout.ms: 3000
+        delivery.timeout.ms: 5000
+        # Сколько send() может ждать метаданные топика при недоступном брокере.
+        max.block.ms: 3000
   jpa:
     open-in-view: false
     hibernate:
@@ -31,3 +52,25 @@ management:
       probes:
         enabled: true
 
+app:
+  # Потребитель событий переводов (Kafka)
+  consumer:
+    # Выключатель: false отключает слушатель и создание DLT-топика (сам сервис продолжает работать). По умолчанию включено.
+    enabled: ${CONSUMER_ENABLED:true}
+    # Блокирующие повторы при временных ошибках (БД недоступна, таймаут). Партиция на это время стоит: так сохраняется
+    # порядок событий. После исчерпания повторов сообщение уходит в DLT (transfers.events.v1.DLT).
+    retry:
+      # Сколько ПОВТОРОВ после первой неудачи (всего попыток на одну больше).
+      attempts: 3
+      initial-interval: 1s
+      multiplier: 2
+      max-interval: 10s
+
+  # Отправка уведомлений из таблицы notifications (NEW -> SENT/FAILED) через заменяемый канал
+  dispatch:
+    # Выключатель: false отключает планировщик отправки (сам код остаётся). По умолчанию включено.
+    enabled: ${DISPATCH_ENABLED:true}
+    # Пауза между проходами (от конца предыдущего).
+    interval: 1s
+    # Сколько уведомлений берём за один проход (самые старые первыми), от 1 до 1000.
+    batch-size: 100
