@@ -186,7 +186,51 @@ docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-s
 4. Kafka недоступна: `docker compose stop kafka`, сделайте перевод: ответ 201, в `outbox_events` у события `published_at` пустой, в логе transfer-service примерно раз в секунду предупреждение `Outbox event ... not sent`. Затем `docker compose start kafka`: через несколько секунд `published_at` заполняется, событие появляется в топике. Если транспорт Kafka недоступен при старте transfer-service, запуск может ждать создания топика до 30 секунд, затем сервис продолжает работу (в этом случае ошибка создания топика попадёт в лог).
 5. `OUTBOX_ENABLED=false` (в `.env` или окружении сервиса) и перезапуск: переводы работают, события копятся в `outbox_events`; после возврата к `true` уходят все накопленные.
 
-Повторная доставка одного `event-id` допустима (at-least-once), поэтому потребитель обязан отбрасывать дубли по `event-id` (`eventId` в теле). Опубликованные строки из `outbox_events` автоматически не удаляются.
+Повторная доставка одного `event-id` допустима (at-least-once), поэтому потребитель обязан отбрасывать дубли по `eventId` из тела события (так делает notification-service). Опубликованные строки из `outbox_events` автоматически не удаляются.
+
+## notification-service
+
+Читает события переводов из топика `transfers.events.v1` и создаёт уведомления, затем «отправляет» их через заменяемый канал. Публичного API у сервиса нет (только `/actuator/health`), порт 8083.
+
+- **Кому и что.** `TransferCompleted`: владельцу счёта зачисления (`toOwnerId`): «Вам поступил перевод {amount} {currency}»; если `toOwnerId` нет (событие старого формата), уведомления нет. `TransferFailed`: инициатору перевода: «Перевод {amount} {currency} не выполнен: {причина}». Отправителю об успешном переводе уведомление не приходит.
+- **Дубли.** На одно событие ровно одно уведомление: `UNIQUE (source_event_id)` и `INSERT ... ON CONFLICT DO NOTHING`. Повторная доставка того же `eventId` ничего не меняет.
+- **Ошибки.** Битое или неизвестное сообщение (нет заголовка `event-type`, невалидный JSON, нет обязательных полей) сразу уходит в `transfers.events.v1.DLT`. Временные ошибки (например, недоступна БД) повторяются: 3 повтора с паузой 1 с, 2 с, 4 с (максимум 10 с), затем сообщение тоже уходит в DLT. Пока идут повторы, партиция стоит: так сохраняется порядок событий одного перевода.
+- **Отправка.** Dispatcher раз в секунду берёт до 100 уведомлений в статусе `NEW`, отправляет через `NotificationChannel` и ставит `SENT` (и `sent_at`) либо `FAILED`. Канал по умолчанию пишет строку в лог. `FAILED` повторно не отправляется.
+- **Выключатели** (переменные окружения; параметры повторов, интервала и размера партии лежат в `application.yml`):
+
+| Переменная | По умолчанию | Что делает |
+|---|---|---|
+| `CONSUMER_ENABLED` | `true` | `false`: слушатель и создание топика DLT выключены, события остаются в Kafka и обработаются после включения |
+| `DISPATCH_ENABLED` | `true` | `false`: уведомления копятся в `NEW` и уйдут после включения |
+
+### Ручная проверка notification-service
+
+Нужны Postgres, Kafka, account-service и transfer-service, запущенные как в предыдущих чек-листах (`docker compose --profile apps up -d --build`), и один перевод. Команды для Compose:
+
+```bash
+# уведомления: после перевода появляется строка, через секунду статус SENT и заполненный sent_at
+docker compose exec postgres psql -U postgres -d notification_db \
+  -c "select type, message, status, created_at, sent_at from notifications order by created_at desc limit 5"
+
+# строка «отправки» в логе
+docker compose logs --tail 20 notification-service
+
+# что попало в DLT: сообщение без заголовков (ключ:значение), потребитель отправит его в DLT без повторов
+echo 'bad-key:не json' | docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic transfers.events.v1 --property parse.key=true --property key.separator=:
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+  --topic transfers.events.v1.DLT --from-beginning --timeout-ms 10000 \
+  --property print.key=true --property print.headers=true
+```
+
+1. Успешный перевод: в `notifications` одна строка `TRANSFER_COMPLETED` для владельца счёта получателя, текст «Вам поступил перевод …», статус `SENT`; в логе сервиса строка с получателем и текстом.
+2. Перевод с суммой больше баланса: строка `TRANSFER_FAILED` для инициатора, «… не выполнен: недостаточно средств».
+3. Повтор: запрос с тем же `Idempotency-Key` и повторное чтение топика (`--from-beginning`) новых уведомлений не создают; число строк равно числу событий. Дубль можно получить и вручную: сбросить смещения группы (`kafka-consumer-groups.sh --group notification-service --reset-offsets --to-earliest --topic transfers.events.v1 --execute` при остановленном notification-service) и запустить сервис снова: строк не прибавится.
+4. Битое сообщение (команда выше): оно появляется в `transfers.events.v1.DLT`, в логе сервиса видна запись об ошибке, обработка следующих событий продолжается.
+5. Остановка и запуск: `docker compose stop notification-service`, сделайте перевод, затем `docker compose start notification-service`: уведомление появится после старта (события за простой читаются с сохранённого смещения).
+6. `CONSUMER_ENABLED=false` (в `.env`) и пересоздание контейнера (`docker compose --profile apps up -d notification-service`): сервис живёт, но новых уведомлений нет; после возврата к `true` создаются все накопленные. Так же `DISPATCH_ENABLED=false`: строки остаются в `NEW`.
+
+Известные ограничения: канал это заглушка; отправка идёт внутри транзакции под блокировкой, для реального канала схему нужно пересматривать (решение 54); `FAILED` и сообщения в DLT разбираются вручную.
 
 ## events-contract
 
@@ -213,7 +257,7 @@ docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-s
 - [x] JWT-аутентификация в account-service: регистрация, вход, RS256, владение счетами, `initiatorId` во внутреннем переводе
 - [x] transfer-service: JWT по публичному ключу, идемпотентные переводы, вызов account-service с таймаутами и повтором, `GET /transfers/{id}`, фоновое добивание `PENDING`
 - [x] transfer-service: outbox (событие в транзакции финализации), публикация в Kafka (`transfers.events.v1`), тесты на Testcontainers с Kafka
-- [ ] notification-service: потребитель событий, защита от дублей, retry и DLQ
+- [x] notification-service: потребитель событий, защита от дублей (`UNIQUE (source_event_id)`), повторы и DLT, dispatcher с заменяемым каналом, тесты на Testcontainers с Kafka
 
 Возможные дальнейшие улучшения: лимиты переводов на Redis, метрики и нагрузочный тест, кэш баланса, двойная запись (ledger), возврат перевода и комиссии, выписка с фильтрами, конвертация валют, холд и подтверждение, Kubernetes.
 

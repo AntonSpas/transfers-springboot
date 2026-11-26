@@ -80,6 +80,12 @@
             <artifactId>postgresql</artifactId>
             <scope>test</scope>
         </dependency>
+        <!-- Kafka для сквозных тестов потребителя (org.testcontainers.kafka.KafkaContainer, образ apache/kafka) -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>kafka</artifactId>
+            <scope>test</scope>
+        </dependency>
 
     </dependencies>
 

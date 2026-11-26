@@ -5,9 +5,21 @@ on:
     branches: [main]
   pull_request:
 
+# Токену нужно только читать код: workflow ничего не пишет в репозиторий
+permissions:
+  contents: read
+
+# Новый push в тот же PR отменяет устаревший прогон (он занимал бы раннер с Postgres и Kafka).
+# Прогоны на main не отменяются: у каждого коммита в main должен быть свой результат.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Зависший Testcontainers иначе держал бы раннер до лимита GitHub (6 часов)
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -15,5 +27,25 @@ jobs:
           distribution: temurin
           java-version: '21'
           cache: maven
-      # Docker на раннерах уже есть, поэтому Testcontainers работает
-      - run: mvn -B verify
+      # Docker на раннерах уже есть, поэтому Testcontainers работает.
+      # -T 1C: модули собираются параллельно (по одному потоку на ядро); если появятся нестабильные тесты, уберите ключ.
+      - run: mvn -B -T 1C verify
+      # Отчёты упавших тестов: без них причину приходится искать в длинном логе
+      - name: Отчёты тестов (только при падении)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: '**/target/surefire-reports/'
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # Дешёвая проверка: docker-compose.yml разбирается, переменные подставляются, профиль apps корректен.
+  # Образы не собираются и не запускаются.
+  compose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose config -q
+      - run: docker compose --profile apps config -q
