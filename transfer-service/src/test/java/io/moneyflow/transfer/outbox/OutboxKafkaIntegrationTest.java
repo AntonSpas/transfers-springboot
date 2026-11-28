@@ -1,5 +1,6 @@
 package io.moneyflow.transfer.outbox;
 
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import com.fasterxml.jackson.databind.JsonNode;
 import io.moneyflow.events.EventTypes;
 import io.moneyflow.events.TransferCompletedEvent;
@@ -187,14 +188,14 @@ class OutboxKafkaIntegrationTest extends KafkaIntegrationTestBase {
 
         OutboxPublisher.Report report = publisher.runOnce();
 
-        assertThat(report).isEqualTo(new OutboxPublisher.Report(1, 1, false));
+        assertThat(report).isEqualTo(new OutboxPublisher.Report(1, 1, false, 0));
         List<ConsumerRecord<String, String>> records = consume(Set.of(transfer.getId().toString()), 1, Duration.ZERO);
         assertThat(records).hasSize(1);
         ConsumerRecord<String, String> record = records.get(0);
         assertThat(record.topic()).isEqualTo(Topics.TRANSFER_EVENTS);
         assertThat(record.key()).isEqualTo(transfer.getId().toString());
         assertThat(header(record, EventTypes.HEADER)).isEqualTo(EventTypes.TRANSFER_COMPLETED);
-        assertThat(header(record, OutboxPublisher.EVENT_ID_HEADER)).isEqualTo(eventId.toString());
+        assertThat(header(record, EventTypes.EVENT_ID_HEADER)).isEqualTo(eventId.toString());
         TransferCompletedEvent event = objectMapper.readValue(record.value(), TransferCompletedEvent.class);
         assertThat(event.eventId()).isEqualTo(eventId);
         assertThat(event.transferId()).isEqualTo(transfer.getId());
@@ -217,8 +218,8 @@ class OutboxKafkaIntegrationTest extends KafkaIntegrationTestBase {
         OutboxPublisher.Report firstPass = publisher.runOnce();
         OutboxPublisher.Report secondPass = publisher.runOnce();
 
-        assertThat(firstPass).isEqualTo(new OutboxPublisher.Report(2, 2, false));
-        assertThat(secondPass).isEqualTo(new OutboxPublisher.Report(0, 0, false));
+        assertThat(firstPass).isEqualTo(new OutboxPublisher.Report(2, 2, false, 0));
+        assertThat(secondPass).isEqualTo(new OutboxPublisher.Report(0, 0, false, 0));
         // после ожидаемых записей ждём ещё, чтобы лишняя запись успела бы появиться
         List<ConsumerRecord<String, String>> records = consume(
                 Set.of(first.getId().toString(), second.getId().toString()), 2, Duration.ofSeconds(2));
@@ -244,7 +245,7 @@ class OutboxKafkaIntegrationTest extends KafkaIntegrationTestBase {
 
         assertThat(result.getResponse().getStatus()).isEqualTo(201);
         UUID transferId = transferIdOf(result);
-        assertThat(publisher.runOnce()).isEqualTo(new OutboxPublisher.Report(1, 1, false));
+        assertThat(publisher.runOnce()).isEqualTo(new OutboxPublisher.Report(1, 1, false, 0));
         List<ConsumerRecord<String, String>> records = consume(Set.of(transferId.toString()), 1, Duration.ZERO);
         assertThat(records).hasSize(1);
         assertThat(header(records.get(0), EventTypes.HEADER)).isEqualTo(EventTypes.TRANSFER_COMPLETED);
@@ -265,7 +266,7 @@ class OutboxKafkaIntegrationTest extends KafkaIntegrationTestBase {
 
         assertThat(result.getResponse().getStatus()).isEqualTo(201);
         UUID transferId = transferIdOf(result);
-        assertThat(publisher.runOnce()).isEqualTo(new OutboxPublisher.Report(1, 1, false));
+        assertThat(publisher.runOnce()).isEqualTo(new OutboxPublisher.Report(1, 1, false, 0));
         List<ConsumerRecord<String, String>> records = consume(Set.of(transferId.toString()), 1, Duration.ZERO);
         assertThat(records).hasSize(1);
         assertThat(header(records.get(0), EventTypes.HEADER)).isEqualTo(EventTypes.TRANSFER_FAILED);
@@ -299,14 +300,15 @@ class OutboxKafkaIntegrationTest extends KafkaIntegrationTestBase {
         DefaultKafkaProducerFactory<String, String> deadFactory = new DefaultKafkaProducerFactory<>(config);
         try {
             OutboxPublisher offline = new OutboxPublisher(repository, new KafkaTemplate<>(deadFactory), txManager,
-                    Clock.systemUTC(), new OutboxProperties(true, Duration.ofSeconds(1), 100, Duration.ofSeconds(2)));
+                    Clock.systemUTC(), new OutboxProperties(true, Duration.ofSeconds(1), 100, Duration.ofSeconds(2), 10),
+                    new SimpleMeterRegistry());
             long started = System.nanoTime();
 
             OutboxPublisher.Report report = offline.runOnce();
 
             assertThat(Duration.ofNanos(System.nanoTime() - started)).as("проход не должен вешаться на минуты")
                     .isLessThan(Duration.ofSeconds(10));
-            assertThat(report).isEqualTo(new OutboxPublisher.Report(1, 0, true));
+            assertThat(report).isEqualTo(new OutboxPublisher.Report(1, 0, true, 0));
             assertThat(publishedAtOf(eventId)).as("событие осталось неотправленным").isNull();
         } finally {
             deadFactory.destroy();
@@ -315,10 +317,10 @@ class OutboxKafkaIntegrationTest extends KafkaIntegrationTestBase {
         // брокер «вернулся» (рабочий publisher из контекста): событие уходит, ничего не потеряно
         OutboxPublisher.Report recovered = publisher.runOnce();
 
-        assertThat(recovered).isEqualTo(new OutboxPublisher.Report(1, 1, false));
+        assertThat(recovered).isEqualTo(new OutboxPublisher.Report(1, 1, false, 0));
         List<ConsumerRecord<String, String>> records = consume(Set.of(transfer.getId().toString()), 1, Duration.ZERO);
         assertThat(records).hasSize(1);
-        assertThat(header(records.get(0), OutboxPublisher.EVENT_ID_HEADER)).isEqualTo(eventId.toString());
+        assertThat(header(records.get(0), EventTypes.EVENT_ID_HEADER)).isEqualTo(eventId.toString());
         assertThat(publishedAtOf(eventId)).isNotNull();
     }
 }

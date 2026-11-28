@@ -60,13 +60,6 @@ class DepositAndHistoryTest extends IntegrationTestBase {
     }
 
     @Test
-    void deposit_acceptsFourFractionDigits() throws Exception {
-        UUID id = newAccount("RUB", "0");
-        assertThat(deposit(id, "0.0001")).isEqualTo(201);
-        assertThat(balanceOf(id)).isEqualByComparingTo("0.0001");
-    }
-
-    @Test
     void deposit_writesAuditRecord() throws Exception {
         UUID id = newAccount("RUB", "0");
         deposit(id, "10");

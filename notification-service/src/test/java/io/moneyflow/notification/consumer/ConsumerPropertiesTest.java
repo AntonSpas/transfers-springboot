@@ -1,6 +1,7 @@
 package io.moneyflow.notification.consumer;
 
 import org.junit.jupiter.api.Test;
+import org.springframework.boot.test.context.ConfigDataApplicationContextInitializer;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 
 import java.time.Duration;
@@ -17,10 +18,20 @@ class ConsumerPropertiesTest {
         runner.run(context -> {
             ConsumerProperties p = context.getBean(ConsumerProperties.class);
             assertThat(p.enabled()).isTrue();
-            assertThat(p.retry().attempts()).isEqualTo(3);
+            assertThat(p.retry().attempts()).isEqualTo(10);
             assertThat(p.retry().initialInterval()).isEqualTo(Duration.ofSeconds(1));
             assertThat(p.retry().multiplier()).isEqualTo(2.0);
-            assertThat(p.retry().maxInterval()).isEqualTo(Duration.ofSeconds(10));
+            assertThat(p.retry().maxInterval()).isEqualTo(Duration.ofSeconds(30));
+        });
+    }
+
+    /** Значения из {@code application.yml} перекрывают значения по умолчанию, поэтому проверяются отдельно. */
+    @Test
+    void applicationYmlKeepsTheSameRetryWindow() {
+        runner.withInitializer(new ConfigDataApplicationContextInitializer()).run(context -> {
+            ConsumerProperties.Retry retry = context.getBean(ConsumerProperties.class).retry();
+            assertThat(retry).isEqualTo(new ConsumerProperties.Retry(
+                    10, Duration.ofSeconds(1), 2.0, Duration.ofSeconds(30)));
         });
     }
 

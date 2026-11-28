@@ -15,6 +15,9 @@ public interface AccountRepository extends JpaRepository<Account, UUID> {
 
     List<Account> findByOwnerId(UUID ownerId);
 
+    /** Счета владельца в устойчивом порядке: валюта, время открытия, id. */
+    List<Account> findByOwnerIdOrderByCurrencyAscCreatedAtAscIdAsc(UUID ownerId);
+
     /**
      * SELECT ... FOR UPDATE: параллельные списания одного счёта выстраиваются в очередь на уровне БД,
      * без повторных попыток, как при одном лишь @Version. @Version остаётся как вторая линия защиты.

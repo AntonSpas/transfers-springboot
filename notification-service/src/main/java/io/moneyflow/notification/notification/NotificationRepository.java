@@ -38,10 +38,13 @@ public interface NotificationRepository extends JpaRepository<Notification, UUID
                        @Param("createdAt") Instant createdAt);
 
     /**
-     * Выбирает до {@code limit} уведомлений в статусе {@code NEW} и блокирует строки до конца транзакции.
-     * {@code SKIP LOCKED} даёт параллельным проходам (несколько экземпляров сервиса) не ждать друг друга и не брать
-     * одну и ту же строку дважды. Порядок {@code created_at, id} детерминирован; запрос опирается на частичный
-     * индекс {@code idx_notifications_new}.
+     * Выбирает до {@code limit} уведомлений, которые пора отправлять, и блокирует строки до конца транзакции:
+     * {@code NEW} без {@code next_attempt_at} или с наступившим, а также {@code SENDING} с истёкшей арендой
+     * ({@code sending_until <= now}). {@code SKIP LOCKED} даёт параллельным проходам (несколько экземпляров сервиса)
+     * не ждать друг друга и не брать одну и ту же строку дважды. Порядок {@code created_at, id} детерминирован.
+     *
+     * <p>Условие {@code status IN (...)} повторяет предикат частичного индекса {@code idx_notifications_dispatch},
+     * чтобы планировщик мог его использовать.
      *
      * <p>{@code MANDATORY}: блокировка живёт, пока открыта транзакция, поэтому вызов вне неё бессмыслен
      * и должен падать, а не открывать собственную (мгновенно закрывающуюся) транзакцию.
@@ -49,12 +52,36 @@ public interface NotificationRepository extends JpaRepository<Notification, UUID
     @Transactional(propagation = Propagation.MANDATORY)
     @Query(nativeQuery = true, value = """
             SELECT * FROM notifications
-            WHERE status = 'NEW'
+            WHERE status IN ('NEW', 'SENDING')
+              AND ((status = 'NEW' AND (next_attempt_at IS NULL OR next_attempt_at <= :now))
+                   OR (status = 'SENDING' AND sending_until <= :now))
             ORDER BY created_at, id
             LIMIT :limit
             FOR UPDATE SKIP LOCKED
             """)
-    List<Notification> lockNew(@Param("limit") int limit);
+    List<Notification> lockDispatchable(@Param("now") Instant now, @Param("limit") int limit);
+
+    /**
+     * Блокирует одну строку для записи итога отправки. Без {@code SKIP LOCKED}: чужую короткую транзакцию надо
+     * дождаться и увидеть её результат.
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    @Query(nativeQuery = true, value = "SELECT * FROM notifications WHERE id = :id FOR UPDATE")
+    Optional<Notification> lockById(@Param("id") UUID id);
+
+    /**
+     * Выбирает до {@code limit} уведомлений в статусе {@code FAILED}, самые старые первыми, и блокирует строки для
+     * возврата в очередь. Занятые другой транзакцией пропускаются.
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    @Query(nativeQuery = true, value = """
+            SELECT * FROM notifications
+            WHERE status = 'FAILED'
+            ORDER BY created_at, id
+            LIMIT :limit
+            FOR UPDATE SKIP LOCKED
+            """)
+    List<Notification> lockFailed(@Param("limit") int limit);
 
     Optional<Notification> findBySourceEventId(UUID sourceEventId);
 }

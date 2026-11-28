@@ -21,6 +21,13 @@ class OutboxDisabledInSharedContextTest extends IntegrationTestBase {
     private OutboxProperties properties;
 
     @Test
+    void cleanupSchedulerIsAbsentButCleanerItselfIsAvailable() {
+        assertThat(context.getBeansOfType(OutboxCleanupScheduling.class)).isEmpty();
+        assertThat(context.getBeansOfType(OutboxCleaner.class)).hasSize(1);
+        assertThat(context.getBean(OutboxCleanupProperties.class).enabled()).isFalse();
+    }
+
+    @Test
     void schedulerAndTopicAreAbsentInTheSharedContext() {
         assertThat(context.getBeansOfType(OutboxScheduling.class)).isEmpty();
         assertThat(context.getBeansOfType(NewTopic.class)).isEmpty();

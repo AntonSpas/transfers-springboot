@@ -155,6 +155,6 @@ class TransferEventsListenerTest extends IntegrationTestBase {
     void errorHandlerAndPropertiesAreRegistered() {
         assertThat(context.getBeansOfType(DefaultErrorHandler.class)).hasSize(1);
         assertThat(properties.enabled()).isFalse();
-        assertThat(properties.retry().attempts()).isEqualTo(3);
+        assertThat(properties.retry().attempts()).isEqualTo(10);
     }
 }

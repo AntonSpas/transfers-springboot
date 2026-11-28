@@ -12,8 +12,8 @@ import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
  * стартуют слушатель и создание DLT-топика.
  *
  * <ul>
- *   <li>Паузы повторов короткие ({@code initial-interval=50ms}: 50, 100 и 200 мс), чтобы тесты на ошибки не ждали
- *   секундами.</li>
+ *   <li>Повторов три и паузы короткие ({@code attempts=3}, {@code initial-interval=50ms}: 50, 100 и 200 мс), чтобы
+ *   тесты на ошибки не ждали минутами (значения по умолчанию дают окно около 3 минут).</li>
  *   <li>Интервал dispatcher выставлен в час, поэтому он не вмешивается в тесты: проходы отправки тесты
  *   вызывают сами ({@code runOnce()}), и результат детерминирован.</li>
  *   <li>Шпионы на сервис и парсер объявлены здесь, а не в тестовом классе: у любого набора {@code @MockitoSpyBean}
@@ -26,6 +26,7 @@ import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
  */
 @SpringBootTest(properties = {
         "app.consumer.enabled=true",
+        "app.consumer.retry.attempts=3",
         "app.consumer.retry.initial-interval=50ms",
         "app.dispatch.interval=1h"
 })

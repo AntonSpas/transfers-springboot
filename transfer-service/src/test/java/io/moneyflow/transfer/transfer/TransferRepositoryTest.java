@@ -159,7 +159,9 @@ class TransferRepositoryTest extends IntegrationTestBase {
 
         assertThatThrownBy(() -> repository.findByIdForUpdate(id))
                 .isInstanceOf(IllegalTransactionStateException.class);
-        assertThatThrownBy(() -> repository.lockStalePending(now(), 10))
+        assertThatThrownBy(() -> lockStale(now(), 10))
+                .isInstanceOf(IllegalTransactionStateException.class);
+        assertThatThrownBy(() -> repository.lockUnreportedExhausted(20, now(), 10))
                 .isInstanceOf(IllegalTransactionStateException.class);
     }
 
@@ -206,7 +208,7 @@ class TransferRepositoryTest extends IntegrationTestBase {
         Transfer fresh = repository.saveAndFlush(pending(base));
         Set<UUID> mine = Set.of(oldest.getId(), older.getId(), completedOld.getId(), failedOld.getId(), fresh.getId());
 
-        List<Transfer> found = tx.execute(s -> repository.lockStalePending(base.minus(1, ChronoUnit.HOURS), 1000));
+        List<Transfer> found = tx.execute(s -> lockStale(base.minus(1, ChronoUnit.HOURS), 1000));
 
         assertThat(found).isNotNull();
         assertThat(found.stream().map(Transfer::getId).filter(mine::contains))
@@ -220,7 +222,7 @@ class TransferRepositoryTest extends IntegrationTestBase {
             repository.saveAndFlush(pending(base.minus(5, ChronoUnit.HOURS).plusSeconds(i)));
         }
 
-        List<Transfer> found = tx.execute(s -> repository.lockStalePending(base.minus(1, ChronoUnit.HOURS), 2));
+        List<Transfer> found = tx.execute(s -> lockStale(base.minus(1, ChronoUnit.HOURS), 2));
 
         assertThat(found).hasSize(2);
     }
@@ -235,12 +237,12 @@ class TransferRepositoryTest extends IntegrationTestBase {
         ExecutorService executor = Executors.newSingleThreadExecutor();
         try {
             tx.executeWithoutResult(s -> {
-                List<Transfer> first = repository.lockStalePending(threshold, 1000);
+                List<Transfer> first = lockStale(threshold, 1000);
                 assertThat(first.stream().map(Transfer::getId)).containsAll(mine);
 
                 // второй запрос не должен ни ждать, ни видеть заблокированные строки
                 Future<List<UUID>> other = executor.submit(() -> new TransactionTemplate(txManager).execute(st ->
-                        repository.lockStalePending(threshold, 1000).stream().map(Transfer::getId).toList()));
+                        lockStale(threshold, 1000).stream().map(Transfer::getId).toList()));
                 List<UUID> seen;
                 try {
                     seen = other.get(10, TimeUnit.SECONDS);
@@ -251,12 +253,17 @@ class TransferRepositoryTest extends IntegrationTestBase {
             });
 
             // после коммита строки снова доступны
-            List<Transfer> again = tx.execute(s -> repository.lockStalePending(threshold, 1000));
+            List<Transfer> again = tx.execute(s -> lockStale(threshold, 1000));
             assertThat(again).isNotNull();
             assertThat(again.stream().map(Transfer::getId)).containsAll(mine);
         } finally {
             executor.shutdownNow();
         }
+    }
+
+    /** Выборка добивания без пределов по попыткам и возрасту: они проверяются в тестах самого добивания. */
+    private List<Transfer> lockStale(Instant olderThan, int limit) {
+        return repository.lockStalePending(olderThan, Integer.MAX_VALUE, Instant.EPOCH, limit);
     }
 
     private static void sleep(long millis) {

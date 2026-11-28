@@ -27,6 +27,9 @@ import java.util.UUID;
 @Table(name = "notifications")
 public class Notification implements Persistable<UUID> {
 
+    /** Длина колонки {@code last_error}. */
+    static final int MAX_LAST_ERROR_LENGTH = 500;
+
     @Id
     private UUID id;
 
@@ -53,6 +56,20 @@ public class Notification implements Persistable<UUID> {
     @Column(name = "sent_at")
     private Instant sentAt;
 
+    /** Число неудачных отправок. */
+    @Column(name = "attempts", nullable = false)
+    private int attempts;
+
+    @Column(name = "next_attempt_at")
+    private Instant nextAttemptAt;
+
+    @Column(name = "last_error", length = MAX_LAST_ERROR_LENGTH)
+    private String lastError;
+
+    /** Конец аренды; заполнен только в статусе {@code SENDING}. */
+    @Column(name = "sending_until")
+    private Instant sendingUntil;
+
     @Transient
     private boolean isNew = true;
 
@@ -71,23 +88,106 @@ public class Notification implements Persistable<UUID> {
         this.status = NotificationStatus.NEW;
     }
 
-    /** Помечает уведомление отправленным. Допустимо только из {@code NEW}. */
-    public void markSent(Instant sentAt) {
-        requireNew();
-        this.status = NotificationStatus.SENT;
-        this.sentAt = Objects.requireNonNull(sentAt, "sentAt");
-    }
-
-    /** Помечает отправку неудачной (терминальный статус, {@code sent_at} остаётся пустым). Допустимо только из {@code NEW}. */
-    public void markFailed() {
-        requireNew();
-        this.status = NotificationStatus.FAILED;
-    }
-
-    private void requireNew() {
-        if (status != NotificationStatus.NEW) {
-            throw new IllegalStateException("Уведомление " + id + " уже в статусе " + status);
+    /**
+     * Захватывает уведомление для отправки: статус {@code SENDING} и аренда до {@code until}. Допустимо из
+     * {@code NEW} и из {@code SENDING} (повторный захват после истёкшей аренды; что она истекла, проверяет выборка
+     * {@link NotificationRepository#lockDispatchable}).
+     */
+    public void claim(Instant until) {
+        Objects.requireNonNull(until, "until");
+        if (status != NotificationStatus.NEW && status != NotificationStatus.SENDING) {
+            throw wrongStatus();
         }
+        this.status = NotificationStatus.SENDING;
+        this.sendingUntil = until;
+    }
+
+    /**
+     * Держится ли ещё захват с арендой до {@code until}: никто не захватил строку заново и не записал итог.
+     * Конец аренды служит отметкой конкретного захвата, потому что у повторного захвата он всегда позже.
+     */
+    public boolean isClaimedUntil(Instant until) {
+        return status == NotificationStatus.SENDING && sendingUntil.equals(until);
+    }
+
+    /**
+     * Помечает уведомление отправленным. Допустимо из любого статуса, кроме {@code SENT}: доставка уже произошла,
+     * и это факт, даже если аренда истекла и другой проход успел записать неудачу.
+     */
+    public void markSent(Instant sentAt) {
+        Objects.requireNonNull(sentAt, "sentAt");
+        if (status == NotificationStatus.SENT) {
+            throw wrongStatus();
+        }
+        this.status = NotificationStatus.SENT;
+        this.sentAt = sentAt;
+        this.sendingUntil = null;
+        this.nextAttemptAt = null;
+    }
+
+    /**
+     * Возвращает уведомление в очередь после неудачной отправки: статус {@code NEW}, не раньше
+     * {@code nextAttemptAt}. Допустимо только из {@code SENDING}; вызывающий проверяет, что захват его
+     * ({@link #isClaimedUntil}).
+     *
+     * @param error причина; сохраняется не длиннее {@value #MAX_LAST_ERROR_LENGTH} символов
+     */
+    public void scheduleRetry(String error, Instant nextAttemptAt) {
+        Objects.requireNonNull(nextAttemptAt, "nextAttemptAt");
+        recordFailure(error, NotificationStatus.NEW);
+        this.nextAttemptAt = nextAttemptAt;
+    }
+
+    /**
+     * Помечает отправку окончательно неудачной ({@code sent_at} остаётся пустым): диспетчер такую строку больше не
+     * берёт, вернуть её можно только вручную ({@link #requeue}). Условия те же, что у {@link #scheduleRetry}.
+     */
+    public void markFailed(String error) {
+        recordFailure(error, NotificationStatus.FAILED);
+    }
+
+    /**
+     * Ручная повторная отправка: {@code FAILED} снова становится {@code NEW}, счётчик попыток начинается заново.
+     * {@code last_error} остаётся, пока его не заменит новая неудача.
+     */
+    public void requeue() {
+        if (status != NotificationStatus.FAILED) {
+            throw wrongStatus();
+        }
+        this.status = NotificationStatus.NEW;
+        this.attempts = 0;
+        this.nextAttemptAt = null;
+    }
+
+    private void recordFailure(String error, NotificationStatus next) {
+        Objects.requireNonNull(error, "error");
+        if (status != NotificationStatus.SENDING) {
+            throw wrongStatus();
+        }
+        this.status = next;
+        this.attempts++;
+        this.lastError = fitLastError(error);
+        this.sendingUntil = null;
+        this.nextAttemptAt = null;
+    }
+
+    private IllegalStateException wrongStatus() {
+        return new IllegalStateException("Уведомление " + id + " в статусе " + status);
+    }
+
+    /**
+     * Приводит текст к тому, что примет колонка: без символа NUL (PostgreSQL его не хранит) и не длиннее предела,
+     * не разрывая суррогатную пару. Иначе запись итога падала бы, и уведомление отправлялось бы снова и снова.
+     */
+    private static String fitLastError(String error) {
+        String clean = error.replace("\0", "");
+        if (clean.length() <= MAX_LAST_ERROR_LENGTH) {
+            return clean;
+        }
+        int end = Character.isHighSurrogate(clean.charAt(MAX_LAST_ERROR_LENGTH - 1))
+                ? MAX_LAST_ERROR_LENGTH - 1
+                : MAX_LAST_ERROR_LENGTH;
+        return clean.substring(0, end);
     }
 
     @Override
@@ -104,6 +204,22 @@ public class Notification implements Persistable<UUID> {
     @PostPersist
     void markNotNew() {
         this.isNew = false;
+    }
+
+    public int getAttempts() {
+        return attempts;
+    }
+
+    public Instant getNextAttemptAt() {
+        return nextAttemptAt;
+    }
+
+    public String getLastError() {
+        return lastError;
+    }
+
+    public Instant getSendingUntil() {
+        return sendingUntil;
     }
 
     public UUID getUserId() {

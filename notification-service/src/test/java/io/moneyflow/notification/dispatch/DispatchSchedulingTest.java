@@ -17,7 +17,9 @@ import static org.mockito.Mockito.when;
 class DispatchSchedulingTest {
 
     private final NotificationDispatcher dispatcher = mock(NotificationDispatcher.class);
-    private final DispatchProperties properties = new DispatchProperties(true, Duration.ofSeconds(2), 100);
+    private final DispatchProperties properties = new DispatchProperties(true, Duration.ofSeconds(2), 100,
+            Duration.ofMinutes(2),
+            new DispatchProperties.Retry(5, Duration.ofSeconds(10), 2.0, Duration.ofMinutes(10)));
     private final DispatchScheduling scheduling = new DispatchScheduling(dispatcher, properties);
 
     @Test

@@ -18,7 +18,7 @@ class PendingRetrySchedulingTest {
 
     private final PendingTransferRetrier retrier = mock(PendingTransferRetrier.class);
     private final PendingRetryProperties properties =
-            new PendingRetryProperties(true, Duration.ofSeconds(15), Duration.ofSeconds(60), 50);
+            new PendingRetryProperties(true, Duration.ofSeconds(15), Duration.ofSeconds(60), 50, 20, Duration.ofHours(24));
     private final PendingRetryScheduling scheduling = new PendingRetryScheduling(retrier, properties);
 
     @Test

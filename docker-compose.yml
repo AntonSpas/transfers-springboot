@@ -125,6 +125,10 @@ services:
     <<: *spring-service
     build: { context: ., args: { MODULE: notification-service } }
     ports: ["8083:8080"]
+    # Redis сервису не нужен, поэтому вместо общего depends_on из x-spring-service (в нём есть redis) задан свой.
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka:    { condition: service_healthy }
     environment:
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/notification_db
       SPRING_DATASOURCE_USERNAME: notification_svc
@@ -136,6 +140,8 @@ services:
       # Отправка уведомлений (dispatcher, канал-заглушка пишет в лог); false отключает её,
       # уведомления при этом копятся в статусе NEW и уйдут после включения (интервал и размер партии — в application.yml)
       DISPATCH_ENABLED: ${DISPATCH_ENABLED:-true}
+      # Секрет для /internal/** (заголовок X-Internal-Token): ручная повторная отправка уведомлений. Пустое значение останавливает старт.
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-internal_dev_token}
 
 volumes:
   pgdata:

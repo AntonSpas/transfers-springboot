@@ -21,7 +21,7 @@ import static org.assertj.core.api.Assertions.catchThrowable;
 
 /**
  * Классификация ошибок, которую использует обработчик ошибок слушателя: всё, что даёт разбор сообщения,
- * «неповторяемое» (сразу в DLT), временные сбои БД повторяются.
+ * «неповторяемое» (сразу в DLT), сбои БД и баги обработчика повторяются.
  */
 class ErrorClassificationTest {
 
@@ -58,10 +58,10 @@ class ErrorClassificationTest {
     }
 
     @Test
-    void preconditionViolationIsNotRetryable() {
-        assertThat(ErrorClassification.isRetryable(new NullPointerException("amount"))).isFalse();
+    void nullPointerExceptionIsABugAndIsRetried() {
+        assertThat(ErrorClassification.isRetryable(new NullPointerException("amount"))).isTrue();
         assertThat(ErrorClassification.isRetryable(
-                new ListenerExecutionFailedException("Listener failed", new NullPointerException("amount")))).isFalse();
+                new ListenerExecutionFailedException("Listener failed", new NullPointerException("amount")))).isTrue();
     }
 
     @Test

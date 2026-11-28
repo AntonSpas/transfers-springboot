@@ -23,7 +23,7 @@ public record AccountClientProperties(
         String url,
         String internalToken,
         @DefaultValue("2s") Duration connectTimeout,
-        @DefaultValue("5s") Duration readTimeout,
+        @DefaultValue("8s") Duration readTimeout,
         @DefaultValue("3") int maxAttempts,
         @DefaultValue("200ms") Duration retryBackoff
 ) {
