@@ -3,6 +3,7 @@ package io.moneyflow.notification.consumer;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.micrometer.core.instrument.MeterRegistry;
 import io.moneyflow.events.EventTypes;
 import io.moneyflow.events.Topics;
 import io.moneyflow.events.TransferCompletedEvent;
@@ -78,6 +79,8 @@ class TransferEventsKafkaIntegrationTest extends KafkaIntegrationTestBase {
     private JdbcTemplate jdbc;
     @Autowired
     private KafkaContainer kafka;
+    @Autowired
+    private MeterRegistry meters;
 
     // ---------- публикация ----------
 
@@ -178,6 +181,17 @@ class TransferEventsKafkaIntegrationTest extends KafkaIntegrationTestBase {
     /** Класс исключения из заголовков DLT: контейнер оборачивает его, поэтому смотрим и причину. */
     private static String exceptionClasses(ConsumerRecord<String, String> record) {
         return header(record, KafkaHeaders.DLT_EXCEPTION_FQCN) + " " + header(record, KafkaHeaders.DLT_EXCEPTION_CAUSE_FQCN);
+    }
+
+    // ---------- метрика DLT ----------
+
+    private double dltCount(String reason) {
+        return meters.get("notification.consumer.dlt").tag("reason", reason).counter().count();
+    }
+
+    /** Счётчик растёт сразу после публикации в DLT, поэтому запись может стать видна чуть раньше него. */
+    private void awaitDltCount(String reason, double expected) {
+        await().atMost(TIMEOUT).untilAsserted(() -> assertThat(dltCount(reason)).isEqualTo(expected));
     }
 
     // ---------- сопоставление аргументов для шпионов ----------
@@ -281,6 +295,8 @@ class TransferEventsKafkaIntegrationTest extends KafkaIntegrationTestBase {
         String key = UUID.randomUUID().toString();
         String payload = json(TestEvents.completed(UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID()));
 
+        double parseBefore = dltCount("parse");
+
         publish("TransferRefunded", key, payload);
 
         List<ConsumerRecord<String, String>> dlt = readDlt(Set.of(key), 1, Duration.ofSeconds(1));
@@ -293,6 +309,7 @@ class TransferEventsKafkaIntegrationTest extends KafkaIntegrationTestBase {
         assertThat(exceptionClasses(record)).contains("EventParseException");
         // без повторов: сообщение разобрано ровно один раз
         verify(eventParser, times(1)).parse(recordWithKey(key));
+        awaitDltCount("parse", parseBefore + 1);
     }
 
     @Test
@@ -338,6 +355,7 @@ class TransferEventsKafkaIntegrationTest extends KafkaIntegrationTestBase {
         String key = failing.transferId().toString();
         String payload = json(failing);
         doThrow(databaseDown()).when(notificationService).handle(completedWithId(failingId));
+        double exhaustedBefore = dltCount("exhausted");
         publish(EventTypes.TRANSFER_COMPLETED, key, payload);
         // следом сообщение с тем же ключом: партиция не должна остаться заблокированной
         UUID nextId = UUID.randomUUID();
@@ -355,5 +373,21 @@ class TransferEventsKafkaIntegrationTest extends KafkaIntegrationTestBase {
         verify(notificationService, times(4)).handle(completedWithId(failingId));
         awaitNotification(nextId);
         assertThat(repository.findBySourceEventId(failingId)).isEmpty();
+        awaitDltCount("exhausted", exhaustedBefore + 1);
+    }
+
+    @Test
+    void nullPointerInHandlerIsRetriedInsteadOfGoingStraightToDlt() throws Exception {
+        UUID eventId = UUID.randomUUID();
+        TransferCompletedEvent event = TestEvents.completed(eventId, UUID.randomUUID(), UUID.randomUUID());
+        String key = event.transferId().toString();
+        doThrow(new NullPointerException("баг")).doThrow(new NullPointerException("баг")).doCallRealMethod()
+                .when(notificationService).handle(completedWithId(eventId));
+
+        publish(event);
+
+        awaitNotification(eventId);
+        verify(notificationService, times(3)).handle(completedWithId(eventId));
+        assertThat(readDlt(Set.of(key), 0, Duration.ofSeconds(2))).isEmpty();
     }
 }

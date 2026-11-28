@@ -4,6 +4,7 @@ import io.moneyflow.notification.support.IntegrationTestBase;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.IllegalTransactionStateException;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -12,6 +13,7 @@ import org.springframework.transaction.support.DefaultTransactionDefinition;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
@@ -96,51 +98,82 @@ class NotificationRepositoryTest extends IntegrationTestBase {
     }
 
     @Test
-    void lockNewOutsideTransactionFails() {
-        assertThatThrownBy(() -> repository.lockNew(10)).isInstanceOf(IllegalTransactionStateException.class);
+    void lockQueriesOutsideTransactionFail() {
+        assertThatThrownBy(() -> repository.lockDispatchable(T0, 10))
+                .isInstanceOf(IllegalTransactionStateException.class);
+        assertThatThrownBy(() -> repository.lockById(UUID.randomUUID()))
+                .isInstanceOf(IllegalTransactionStateException.class);
+        assertThatThrownBy(() -> repository.lockFailed(10))
+                .isInstanceOf(IllegalTransactionStateException.class);
     }
 
-    @Test
-    void lockNewReturnsOnlyNewInCreatedAtOrderWithinLimit() {
-        UUID first = UUID.randomUUID();
-        UUID second = UUID.randomUUID();
-        UUID third = UUID.randomUUID();
-        UUID alreadySent = UUID.randomUUID();
-        // вставка не по порядку создания: порядок выборки определяется created_at, а не вставкой
-        insert(third, T0.plusSeconds(3));
-        insert(first, T0.plusSeconds(1));
-        insert(alreadySent, T0);
-        insert(second, T0.plusSeconds(2));
-        jdbc.update("UPDATE notifications SET status = 'SENT', sent_at = now() WHERE source_event_id = ?", alreadySent);
+    private void set(UUID eventId, String assignments, Instant... values) {
+        Object[] args = new Object[values.length + 1];
+        for (int i = 0; i < values.length; i++) {
+            args[i] = values[i].atOffset(ZoneOffset.UTC);
+        }
+        args[values.length] = eventId;
+        jdbc.update("UPDATE notifications SET " + assignments + " WHERE source_event_id = ?", args);
+    }
 
-        List<UUID> locked = tx.execute(status -> repository.lockNew(2).stream()
+    private List<UUID> dispatchable(Instant now, int limit) {
+        return tx.execute(status -> repository.lockDispatchable(now, limit).stream()
                 .map(Notification::getSourceEventId).toList());
-
-        assertThat(locked).containsExactly(first, second);
     }
 
     @Test
-    void lockNewOnEmptyQueueReturnsEmptyList() {
-        List<Notification> locked = tx.execute(status -> repository.lockNew(10));
+    void lockDispatchableReturnsDueNewAndExpiredSendingInCreatedAtOrder() {
+        Instant now = T0.plusSeconds(100);
+        UUID plain = UUID.randomUUID();
+        UUID due = UUID.randomUUID();
+        UUID expired = UUID.randomUUID();
+        UUID expiringNow = UUID.randomUUID();
+        UUID postponed = UUID.randomUUID();
+        UUID leased = UUID.randomUUID();
+        UUID sent = UUID.randomUUID();
+        UUID failed = UUID.randomUUID();
+        // вставка не по порядку создания: порядок выборки определяется created_at, а не вставкой
+        insert(expiringNow, T0.plusSeconds(4));
+        insert(plain, T0.plusSeconds(1));
+        insert(postponed, T0);
+        insert(leased, T0);
+        insert(sent, T0);
+        insert(failed, T0);
+        insert(expired, T0.plusSeconds(3));
+        insert(due, T0.plusSeconds(2));
+        set(due, "next_attempt_at = ?", now);
+        set(postponed, "next_attempt_at = ?", now.plusNanos(1000));
+        set(expired, "status = 'SENDING', sending_until = ?", now.minusSeconds(1));
+        set(expiringNow, "status = 'SENDING', sending_until = ?", now);
+        set(leased, "status = 'SENDING', sending_until = ?", now.plusNanos(1000));
+        set(sent, "status = 'SENT', sent_at = ?", now);
+        set(failed, "status = 'FAILED'");
 
-        assertThat(locked).isEmpty();
+        assertThat(dispatchable(now, 10)).containsExactly(plain, due, expired, expiringNow);
+        assertThat(dispatchable(now, 2)).containsExactly(plain, due);
     }
 
     @Test
-    void lockNewSkipsRowsLockedByAnotherTransaction() throws Exception {
+    void lockDispatchableOnEmptyQueueReturnsEmptyList() {
+        assertThat(dispatchable(T0, 10)).isEmpty();
+    }
+
+    @Test
+    void lockDispatchableSkipsRowsLockedByAnotherTransaction() throws Exception {
         UUID locked = UUID.randomUUID();
         UUID free = UUID.randomUUID();
         insert(locked, T0);
         insert(free, T0.plusSeconds(1));
+        Instant now = T0.plusSeconds(10);
         ExecutorService other = Executors.newSingleThreadExecutor();
         TransactionStatus outer = txManager.getTransaction(new DefaultTransactionDefinition());
         try {
             // первая транзакция берёт самую раннюю строку и держит блокировку, пока не завершится
-            assertThat(repository.lockNew(1)).extracting(Notification::getSourceEventId).containsExactly(locked);
+            assertThat(repository.lockDispatchable(now, 1))
+                    .extracting(Notification::getSourceEventId).containsExactly(locked);
 
             // без SKIP LOCKED вторая транзакция зависла бы на заблокированной строке и упала бы по таймауту get()
-            Future<List<UUID>> seenByOther = other.submit(() -> new TransactionTemplate(txManager)
-                    .execute(status -> repository.lockNew(10).stream().map(Notification::getSourceEventId).toList()));
+            Future<List<UUID>> seenByOther = other.submit(() -> dispatchable(now, 10));
 
             assertThat(seenByOther.get(10, TimeUnit.SECONDS)).containsExactly(free);
         } finally {
@@ -150,18 +183,71 @@ class NotificationRepositoryTest extends IntegrationTestBase {
     }
 
     @Test
-    void statusChangeOfLockedEntityIsPersisted() {
+    void claimAndResultOfLockedEntityArePersisted() {
         UUID eventId = UUID.randomUUID();
         insert(eventId, T0);
-        Instant sentAt = Instant.parse("2026-11-24T10:00:05.654321Z");
+        Instant now = T0.plusSeconds(10);
+        Instant until = now.plusSeconds(120);
 
-        tx.executeWithoutResult(status -> repository.lockNew(10).forEach(n -> n.markSent(sentAt)));
+        tx.executeWithoutResult(status -> repository.lockDispatchable(now, 10).forEach(n -> n.claim(until)));
+
+        Notification claimed = repository.findBySourceEventId(eventId).orElseThrow();
+        assertThat(claimed.getStatus()).isEqualTo(NotificationStatus.SENDING);
+        assertThat(claimed.getSendingUntil()).isEqualTo(until);
+        assertThat(dispatchable(now, 10)).isEmpty();
+
+        tx.executeWithoutResult(status ->
+                repository.lockById(claimed.getId()).orElseThrow().markFailed("отказ"));
+
+        Notification failed = repository.findBySourceEventId(eventId).orElseThrow();
+        assertThat(failed.getStatus()).isEqualTo(NotificationStatus.FAILED);
+        assertThat(failed.getAttempts()).isEqualTo(1);
+        assertThat(failed.getLastError()).isEqualTo("отказ");
+        assertThat(failed.getSendingUntil()).isNull();
+    }
+
+    @Test
+    void newRowGetsDefaultDispatchState() {
+        UUID eventId = UUID.randomUUID();
+        insert(eventId, T0);
 
         Notification n = repository.findBySourceEventId(eventId).orElseThrow();
-        assertThat(n.getStatus()).isEqualTo(NotificationStatus.SENT);
-        assertThat(n.getSentAt()).isEqualTo(sentAt);
-        List<Notification> stillNew = tx.execute(status -> repository.lockNew(10));
-        assertThat(stillNew).isEmpty();
+
+        assertThat(n.getAttempts()).isZero();
+        assertThat(n.getNextAttemptAt()).isNull();
+        assertThat(n.getLastError()).isNull();
+        assertThat(n.getSendingUntil()).isNull();
+    }
+
+    @Test
+    void leaseIsRequiredExactlyForSendingRows() {
+        UUID eventId = UUID.randomUUID();
+        insert(eventId, T0);
+
+        assertThatThrownBy(() -> set(eventId, "status = 'SENDING'"))
+                .isInstanceOf(DataIntegrityViolationException.class);
+        assertThatThrownBy(() -> set(eventId, "sending_until = ?", T0))
+                .isInstanceOf(DataIntegrityViolationException.class);
+    }
+
+    @Test
+    void lockFailedReturnsOnlyFailedOldestFirstWithinLimit() {
+        UUID first = UUID.randomUUID();
+        UUID second = UUID.randomUUID();
+        UUID third = UUID.randomUUID();
+        UUID fresh = UUID.randomUUID();
+        insert(third, T0.plusSeconds(3));
+        insert(fresh, T0);
+        insert(first, T0.plusSeconds(1));
+        insert(second, T0.plusSeconds(2));
+        for (UUID eventId : List.of(first, second, third)) {
+            set(eventId, "status = 'FAILED'");
+        }
+
+        List<UUID> locked = tx.execute(status -> repository.lockFailed(2).stream()
+                .map(Notification::getSourceEventId).toList());
+
+        assertThat(locked).containsExactly(first, second);
     }
 
     @Test

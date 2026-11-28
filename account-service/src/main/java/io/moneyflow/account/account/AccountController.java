@@ -17,6 +17,7 @@ import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
 
 import java.net.URI;
+import java.util.List;
 import java.util.UUID;
 
 @RestController
@@ -37,6 +38,14 @@ public class AccountController {
         URI location = ServletUriComponentsBuilder.fromCurrentRequest()
                 .path("/{id}").buildAndExpand(account.getId()).toUri();
         return ResponseEntity.created(location).body(AccountResponse.from(account));
+    }
+
+    /** Счета пользователя из токена, по порядку валют; без пагинации. */
+    @GetMapping
+    public List<AccountResponse> list(@AuthenticationPrincipal Jwt jwt) {
+        return service.getOwnedAccounts(CurrentUser.id(jwt)).stream()
+                .map(AccountResponse::from)
+                .toList();
     }
 
     @GetMapping("/{id}")

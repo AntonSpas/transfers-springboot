@@ -81,6 +81,16 @@ class OutboxRepositoryIntegrationTest extends IntegrationTestBase {
     }
 
     @Test
+    void parkedEventsAreNotSelectedAndDoNotConsumeTheLimit() {
+        OutboxEvent parked = newEvent(Duration.ofHours(5));
+        parked.recordPublishFailure("too large", 1, Instant.now().truncatedTo(ChronoUnit.MICROS));
+        repository.saveAndFlush(parked);
+        OutboxEvent pending = saved(Duration.ofHours(1));
+
+        assertThat(lockedIds(1)).containsExactly(pending.getId());
+    }
+
+    @Test
     void limitTakesTheOldestOnes() {
         OutboxEvent oldest = saved(Duration.ofHours(3));
         OutboxEvent middle = saved(Duration.ofHours(2));

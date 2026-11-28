@@ -10,6 +10,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -76,6 +77,15 @@ public class AccountService {
     }
 
     /**
+     * Все счета пользователя по валюте, внутри валюты по времени открытия (счетов одной валюты может быть несколько).
+     * Для неизвестного пользователя список пуст.
+     */
+    @Transactional(readOnly = true)
+    public List<Account> getOwnedAccounts(UUID userId) {
+        return accounts.findByOwnerIdOrderByCurrencyAscCreatedAtAscIdAsc(userId);
+    }
+
+    /**
      * Системное пополнение без пользователя (для служебных вызовов и подготовки данных в тестах):
      * владелец не проверяется, в аудит пишется actorId = null. Публичное API использует {@link #depositByUser}.
      */
@@ -100,6 +110,8 @@ public class AccountService {
      * не должен получить ни проводку по ключу владельца, ни ответ о конфликте ключа.
      * Сумма уже проверена валидацией (положительная, не более 4 знаков после запятой);
      * RoundingMode.UNNECESSARY лишь приводит масштаб к 4 и упадёт, если округление вдруг потребуется.
+     * Точность по валюте счёта проверяется после идемпотентности: повтор уже выполненного пополнения
+     * получает сохранённую проводку, даже если она записана до появления этой проверки.
      */
     private DepositResult doDeposit(UUID accountId, UUID userId, BigDecimal amount, String idempotencyKey) {
         if (idempotencyKey == null || idempotencyKey.isBlank() || idempotencyKey.length() > MAX_IDEMPOTENCY_KEY_LENGTH) {
@@ -121,6 +133,9 @@ public class AccountService {
             }
             return new DepositResult(existing.get(), true);
         }
+        currencies.findById(account.getCurrency())
+                .orElseThrow(() -> new UnsupportedCurrencyException(account.getCurrency()))
+                .requirePrecision(normalized);
 
         account.credit(normalized);
         AccountTransaction tx = transactions.save(

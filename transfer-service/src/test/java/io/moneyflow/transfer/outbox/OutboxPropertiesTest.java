@@ -20,19 +20,21 @@ class OutboxPropertiesTest {
             assertThat(p.interval()).isEqualTo(Duration.ofSeconds(1));
             assertThat(p.batchSize()).isEqualTo(100);
             assertThat(p.sendTimeout()).isEqualTo(Duration.ofSeconds(5));
+            assertThat(p.maxAttempts()).isEqualTo(10);
         });
     }
 
     @Test
     void valuesAreBoundFromProperties() {
         runner.withPropertyValues("app.outbox.enabled=false", "app.outbox.interval=250ms",
-                        "app.outbox.batch-size=7", "app.outbox.send-timeout=2s")
+                        "app.outbox.batch-size=7", "app.outbox.send-timeout=2s", "app.outbox.max-attempts=3")
                 .run(context -> {
                     OutboxProperties p = context.getBean(OutboxProperties.class);
                     assertThat(p.enabled()).isFalse();
                     assertThat(p.interval()).isEqualTo(Duration.ofMillis(250));
                     assertThat(p.batchSize()).isEqualTo(7);
                     assertThat(p.sendTimeout()).isEqualTo(Duration.ofSeconds(2));
+                    assertThat(p.maxAttempts()).isEqualTo(3);
                 });
     }
 
@@ -50,7 +52,9 @@ class OutboxPropertiesTest {
                 {"app.outbox.batch-size=0", "batch-size"},
                 {"app.outbox.batch-size=1001", "batch-size"},
                 {"app.outbox.send-timeout=0s", "send-timeout"},
-                {"app.outbox.send-timeout=-5s", "send-timeout"}
+                {"app.outbox.send-timeout=-5s", "send-timeout"},
+                {"app.outbox.max-attempts=0", "max-attempts"},
+                {"app.outbox.max-attempts=1001", "max-attempts"}
         };
         for (String[] c : cases) {
             runner.withPropertyValues(c[0]).run(context -> {

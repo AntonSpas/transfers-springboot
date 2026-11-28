@@ -119,7 +119,8 @@ class TransferCreateApiTest extends IntegrationTestBase {
             "403,FORBIDDEN",
             "422,INSUFFICIENT_FUNDS",
             "422,CURRENCY_MISMATCH",
-            "422,SAME_ACCOUNT"
+            "422,SAME_ACCOUNT",
+            "422,INVALID_AMOUNT_PRECISION"
     })
     void businessRefusalIsAlsoCreated201WithFailedStatus(int accountStatus, String code) throws Exception {
         accountMock.expectCall(once()).andRespond(accountMock.error(accountStatus, code));

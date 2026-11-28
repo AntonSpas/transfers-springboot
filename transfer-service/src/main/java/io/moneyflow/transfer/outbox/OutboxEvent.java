@@ -22,14 +22,17 @@ import java.util.UUID;
  * at-least-once). Поэтому сущность реализует {@link Persistable}, как {@code Transfer}: без этого {@code save}
  * делал бы лишний SELECT.
  *
- * <p>Единственное изменение после создания: {@link #markPublished} (ставит publisher после подтверждения Kafka).
- * Содержимое ({@code payload}) не меняется никогда.
+ * <p>После создания меняется только состояние отправки, и только publisher: {@link #markPublished} (после
+ * подтверждения Kafka) и {@link #recordPublishFailure} (отправка не удалась по вине самого события). Содержимое
+ * ({@code payload}) не меняется никогда.
  */
 @Entity
 @Table(name = "outbox_events")
 public class OutboxEvent implements Persistable<UUID> {
 
     static final int MAX_TYPE_LENGTH = 100;
+    /** Длина колонки {@code last_error}. */
+    static final int MAX_LAST_ERROR_LENGTH = 500;
 
     @Id
     @Column(name = "id", nullable = false, updatable = false)
@@ -54,6 +57,17 @@ public class OutboxEvent implements Persistable<UUID> {
 
     @Column(name = "published_at")
     private Instant publishedAt;
+
+    /** Неудачные отправки по вине самого события; сбои брокера сюда не входят. */
+    @Column(name = "attempts", nullable = false)
+    private int attempts;
+
+    @Column(name = "last_error", length = MAX_LAST_ERROR_LENGTH)
+    private String lastError;
+
+    /** Когда событие «запарковано»: publisher такие не берёт, вернуть можно только вручную. */
+    @Column(name = "parked_at")
+    private Instant parkedAt;
 
     @Transient
     private boolean newEntity = true;
@@ -97,6 +111,47 @@ public class OutboxEvent implements Persistable<UUID> {
         return true;
     }
 
+    /**
+     * Учитывает неудачную отправку по вине самого события. Когда попыток становится {@code maxAttempts}, событие
+     * «паркуется».
+     *
+     * @param error причина; сохраняется не длиннее {@value #MAX_LAST_ERROR_LENGTH} символов
+     * @return {@code true}, если событие запарковано этим вызовом
+     * @throws IllegalStateException событие уже отправлено или запарковано
+     */
+    public boolean recordPublishFailure(String error, int maxAttempts, Instant now) {
+        require(error, "error");
+        require(now, "now");
+        if (maxAttempts < 1) {
+            throw new IllegalArgumentException("maxAttempts must be positive");
+        }
+        if (publishedAt != null || parkedAt != null) {
+            throw new IllegalStateException("Outbox event " + id + " is already published or parked");
+        }
+        attempts++;
+        lastError = fitLastError(error);
+        if (attempts < maxAttempts) {
+            return false;
+        }
+        parkedAt = now;
+        return true;
+    }
+
+    /**
+     * Приводит текст к тому, что примет колонка: без символа NUL (PostgreSQL его не хранит) и не длиннее предела,
+     * не разрывая суррогатную пару. Иначе падал бы коммит всего прохода.
+     */
+    private static String fitLastError(String error) {
+        String clean = error.replace("\0", "");
+        if (clean.length() <= MAX_LAST_ERROR_LENGTH) {
+            return clean;
+        }
+        int end = Character.isHighSurrogate(clean.charAt(MAX_LAST_ERROR_LENGTH - 1))
+                ? MAX_LAST_ERROR_LENGTH - 1
+                : MAX_LAST_ERROR_LENGTH;
+        return clean.substring(0, end);
+    }
+
     private static void require(Object value, String name) {
         if (value == null) {
             throw new IllegalArgumentException(name + " must not be null");
@@ -137,5 +192,17 @@ public class OutboxEvent implements Persistable<UUID> {
 
     public Instant getPublishedAt() {
         return publishedAt;
+    }
+
+    public int getAttempts() {
+        return attempts;
+    }
+
+    public String getLastError() {
+        return lastError;
+    }
+
+    public Instant getParkedAt() {
+        return parkedAt;
     }
 }

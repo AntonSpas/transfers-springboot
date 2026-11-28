@@ -1,6 +1,8 @@
 package io.moneyflow.notification.consumer;
 
 import org.junit.jupiter.api.Test;
+import org.springframework.boot.context.properties.bind.Binder;
+import org.springframework.boot.context.properties.source.MapConfigurationPropertySource;
 import org.springframework.util.backoff.BackOff;
 import org.springframework.util.backoff.BackOffExecution;
 
@@ -31,10 +33,16 @@ class ConsumerErrorHandlingConfigTest {
     }
 
     @Test
-    void defaultsGiveThreeRetriesWithDoublingPause() {
-        // всего 4 попытки: первая и 3 повтора после пауз 1 с, 2 с, 4 с
-        assertThat(pauses(new ConsumerProperties.Retry(3, Duration.ofSeconds(1), 2.0, Duration.ofSeconds(10))))
-                .containsExactly(1000L, 2000L, 4000L);
+    void defaultsGiveRetryWindowOfAboutThreeMinutes() {
+        ConsumerProperties defaults = new Binder(new MapConfigurationPropertySource())
+                .bindOrCreate("app.consumer", ConsumerProperties.class);
+
+        List<Long> pauses = pauses(defaults.retry());
+
+        // всего 11 попыток: первая и 10 повторов
+        assertThat(pauses).containsExactly(1000L, 2000L, 4000L, 8000L, 16_000L,
+                30_000L, 30_000L, 30_000L, 30_000L, 30_000L);
+        assertThat(pauses.stream().mapToLong(Long::longValue).sum()).isEqualTo(181_000L);
     }
 
     @Test

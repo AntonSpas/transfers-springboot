@@ -223,7 +223,7 @@ class InternalTransferTest extends IntegrationTestBase {
         UUID to = newAccount("RUB", "0");
         UUID transferId = UUID.randomUUID();
 
-        transfer(transferId, from, to, "10.0001", "RUB")
+        transfer(transferId, from, to, "10.01", "RUB")
                 .andExpect(status().isUnprocessableEntity())
                 .andExpect(jsonPath("$.code").value("INSUFFICIENT_FUNDS"));
 

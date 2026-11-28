@@ -5,6 +5,8 @@ import io.moneyflow.account.support.IntegrationTestBase;
 import org.junit.jupiter.api.Test;
 import org.springframework.http.MediaType;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -156,6 +158,44 @@ class AccountApiTest extends IntegrationTestBase {
                 .andExpect(jsonPath("$.currency").value("USD"))
                 .andExpect(jsonPath("$.balance").value(10.0))
                 .andExpect(jsonPath("$.ownerId").doesNotExist());
+    }
+
+    @Test
+    void listAccounts_returnsOnlyOwnAccounts_orderedByCurrencyThenOpening() throws Exception {
+        UUID ownerId = newUser();
+        UUID usd = newAccount(ownerId, "USD", "10");
+        UUID rubFirst = newAccount(ownerId, "RUB", "0");
+        UUID eur = newAccount(ownerId, "EUR", "0");
+        UUID rubSecond = newAccount(ownerId, "RUB", "0");
+        newAccount("RUB", "5"); // чужой
+
+        JsonNode list = body(mockMvc.perform(get("/accounts").header(AUTHORIZATION, bearer(ownerId)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.length()").value(4))
+                .andExpect(jsonPath("$[3].currency").value("USD"))
+                .andExpect(jsonPath("$[3].ownerId").value(ownerId.toString()))
+                .andExpect(jsonPath("$[3].balance").value(10.0)));
+
+        List<UUID> ids = new ArrayList<>();
+        list.forEach(account -> ids.add(UUID.fromString(account.get("id").asText())));
+        assertThat(ids).containsExactly(eur, rubFirst, rubSecond, usd);
+    }
+
+    @Test
+    void listAccounts_userWithoutAccounts_getsEmptyList() throws Exception {
+        newAccount("RUB", "5"); // чужой
+
+        mockMvc.perform(get("/accounts").header(AUTHORIZATION, bearer(newUser())))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$").isArray())
+                .andExpect(jsonPath("$").isEmpty());
+    }
+
+    @Test
+    void listAccounts_withoutToken_returns401() throws Exception {
+        mockMvc.perform(get("/accounts"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.code").value("UNAUTHORIZED"));
     }
 
     @Test

@@ -4,6 +4,8 @@ import io.moneyflow.account.account.Account;
 import io.moneyflow.account.account.AccountAccessDeniedException;
 import io.moneyflow.account.account.AccountNotFoundException;
 import io.moneyflow.account.account.AccountRepository;
+import io.moneyflow.account.account.CurrencyRepository;
+import io.moneyflow.account.account.UnsupportedCurrencyException;
 import io.moneyflow.account.audit.AuditActions;
 import io.moneyflow.account.audit.AuditService;
 import io.moneyflow.account.transaction.AccountTransaction;
@@ -26,12 +28,14 @@ public class TransferService {
     private final AccountRepository accounts;
     private final AccountTransactionRepository transactions;
     private final AuditService audit;
+    private final CurrencyRepository currencies;
 
     public TransferService(AccountRepository accounts, AccountTransactionRepository transactions,
-                           AuditService audit) {
+                           AuditService audit, CurrencyRepository currencies) {
         this.accounts = accounts;
         this.transactions = transactions;
         this.audit = audit;
+        this.currencies = currencies;
     }
 
     /**
@@ -50,6 +54,8 @@ public class TransferService {
      *       в UNIQUE (transfer_id, type) с ошибкой 500.</li>
      *   <li>Повтор возвращает сохранённый результат без повторного движения денег (идемпотентность, решение №4).
      *       Если параметры повтора отличаются, это 409.</li>
+     *   <li>Точность суммы по валюте (422) проверяется после идемпотентности (повтор уже выполненного перевода
+     *       получает сохранённый результат) и до баланса.</li>
      *   <li>Баланс проверяется уже под блокировкой, поэтому результат проверки не устареет до списания.</li>
      * </ol>
      * В аудит пишется {@code initiatorId}; владельцы обоих счетов возвращаются для notification-service.
@@ -85,6 +91,10 @@ public class TransferService {
             TransferResult replayed = replay(existing, transferId, fromAccountId, toAccountId, normalized);
             return new TransferOutcome(replayed, from.getOwnerId(), to.getOwnerId());
         }
+
+        currencies.findById(from.getCurrency())
+                .orElseThrow(() -> new UnsupportedCurrencyException(from.getCurrency()))
+                .requirePrecision(normalized);
 
         if (from.getBalance().compareTo(normalized) < 0) {
             throw new InsufficientFundsException(fromAccountId);

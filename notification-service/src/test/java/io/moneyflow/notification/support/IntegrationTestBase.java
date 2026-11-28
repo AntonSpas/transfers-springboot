@@ -1,5 +1,6 @@
 package io.moneyflow.notification.support;
 
+import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.annotation.Import;
 
@@ -17,6 +18,7 @@ import org.springframework.context.annotation.Import;
         "app.consumer.enabled=false",
         "app.dispatch.enabled=false"
 })
+@AutoConfigureMockMvc
 @Import(PostgresTestConfig.class)
 public abstract class IntegrationTestBase {
 }

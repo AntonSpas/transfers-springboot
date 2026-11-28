@@ -21,7 +21,8 @@ import java.util.Set;
  * <ul>
  *   <li>201/200 → {@link AccountCallResult.Completed};</li>
  *   <li>404 {@code ACCOUNT_NOT_FOUND}, 403 {@code FORBIDDEN}, 422 {@code INSUFFICIENT_FUNDS}/{@code CURRENCY_MISMATCH}/
- *       {@code SAME_ACCOUNT} → {@link AccountCallResult.Rejected} с кодом ошибки, без повтора;</li>
+ *       {@code SAME_ACCOUNT}/{@code INVALID_AMOUNT_PRECISION} → {@link AccountCallResult.Rejected} с кодом ошибки,
+ *       без повтора;</li>
  *   <li>503, любой 5xx, таймаут, сетевая ошибка → повтор с тем же {@code transferId} (account-service идемпотентен);
  *       после исчерпания попыток → {@link AccountCallResult.Unavailable};</li>
  *   <li>всё остальное (401 {@code UNAUTHORIZED}, 400, 409 {@code TRANSFER_CONFLICT}, неизвестный код, нечитаемый
@@ -42,7 +43,7 @@ public class AccountServiceClient {
     private static final String TRANSFERS_PATH = "/internal/transfers";
     private static final int MAX_DETAIL_LENGTH = 200;
     private static final Set<String> UNPROCESSABLE_CODES =
-            Set.of("INSUFFICIENT_FUNDS", "CURRENCY_MISMATCH", "SAME_ACCOUNT");
+            Set.of("INSUFFICIENT_FUNDS", "CURRENCY_MISMATCH", "SAME_ACCOUNT", "INVALID_AMOUNT_PRECISION");
 
     private final RestClient restClient;
     private final int maxAttempts;

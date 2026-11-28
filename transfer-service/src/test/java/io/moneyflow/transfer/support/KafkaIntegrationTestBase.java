@@ -22,7 +22,8 @@ import java.util.UUID;
         "account-service.retry-backoff=0ms",
         "app.pending-retry.enabled=false",
         "app.outbox.enabled=true",
-        "app.outbox.interval=1h"
+        "app.outbox.interval=1h",
+        "app.outbox.cleanup.enabled=false"
 })
 @AutoConfigureMockMvc
 @Import({PostgresTestConfig.class, KafkaTestConfig.class, JwtTestConfig.class, AccountMockTestConfig.class})

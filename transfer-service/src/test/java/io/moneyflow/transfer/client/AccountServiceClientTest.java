@@ -151,7 +151,8 @@ class AccountServiceClientTest {
             "403,FORBIDDEN",
             "422,INSUFFICIENT_FUNDS",
             "422,CURRENCY_MISMATCH",
-            "422,SAME_ACCOUNT"
+            "422,SAME_ACCOUNT",
+            "422,INVALID_AMOUNT_PRECISION"
     })
     void businessRefusalIsRejectedWithItsCodeAndNotRetried(int status, String code) {
         expectCall(ExpectedCount.once()).andRespond(error(status, code));

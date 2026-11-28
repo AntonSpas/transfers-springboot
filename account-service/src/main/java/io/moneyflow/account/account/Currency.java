@@ -8,6 +8,8 @@ import org.hibernate.annotations.Immutable;
 import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.type.SqlTypes;
 
+import java.math.BigDecimal;
+
 /** Справочник валют (сидируется миграцией V2), только для чтения. */
 @Entity
 @Immutable
@@ -40,5 +42,16 @@ public class Currency {
 
     public short getMinorUnits() {
         return minorUnits;
+    }
+
+    /**
+     * Отклоняет сумму, точнее которой валюта не бывает. Нули в конце не считаются: 10.5000 для двух знаков допустимо.
+     *
+     * @throws InvalidAmountPrecisionException если значащих знаков после запятой больше {@code minorUnits}
+     */
+    public void requirePrecision(BigDecimal amount) {
+        if (amount.stripTrailingZeros().scale() > minorUnits) {
+            throw new InvalidAmountPrecisionException(code, minorUnits);
+        }
     }
 }

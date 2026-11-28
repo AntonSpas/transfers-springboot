@@ -25,8 +25,9 @@ import java.util.UUID;
  * Поэтому сущность реализует {@link Persistable}: без этого {@code save} для сущности с готовым id
  * сначала делал бы лишний SELECT (merge).
  *
- * <p>Состояние меняется только методами {@link #complete} и {@link #fail}, и только из {@code PENDING}.
- * Повторный вызов на финальном статусе ничего не меняет и возвращает {@code false}.
+ * <p>Статус меняется только методами {@link #complete} и {@link #fail}, и только из {@code PENDING}.
+ * Повторный вызов на финальном статусе ничего не меняет и возвращает {@code false}. То же правило у учёта фонового
+ * добивания ({@link #recordRetryAttempt}, {@link #markRetryExhausted}); {@code updatedAt} они не трогают.
  */
 @Entity
 @Table(name = "transfers")
@@ -71,6 +72,16 @@ public class Transfer implements Persistable<UUID> {
 
     @Column(name = "updated_at", nullable = false)
     private Instant updatedAt;
+
+    /** Неудачные фоновые попытки добивания; запросы клиента сюда не входят. */
+    @Column(name = "retry_attempts", nullable = false)
+    private int retryAttempts;
+
+    @Column(name = "last_attempt_at")
+    private Instant lastAttemptAt;
+
+    @Column(name = "retry_exhausted_at")
+    private Instant retryExhaustedAt;
 
     @Transient
     private boolean newEntity = true;
@@ -145,6 +156,33 @@ public class Transfer implements Persistable<UUID> {
     }
 
     /**
+     * Учитывает фоновую попытку добивания, после которой перевод остался {@code PENDING}: счётчик растёт,
+     * {@code lastAttemptAt} сдвигается. Для финального статуса ничего не меняет и возвращает {@code false}.
+     */
+    public boolean recordRetryAttempt(Instant now) {
+        require(now, "now");
+        if (status != TransferStatus.PENDING) {
+            return false;
+        }
+        retryAttempts++;
+        lastAttemptAt = now;
+        return true;
+    }
+
+    /**
+     * Отмечает, что предел добивания достигнут. Статус не меняется: деньги могли уйти. Возвращает {@code true} только
+     * при первой отметке {@code PENDING}-перевода.
+     */
+    public boolean markRetryExhausted(Instant now) {
+        require(now, "now");
+        if (status != TransferStatus.PENDING || retryExhaustedAt != null) {
+            return false;
+        }
+        retryExhaustedAt = now;
+        return true;
+    }
+
+    /**
      * Совпадают ли параметры повторного запроса с сохранённым переводом (для ответа 200 или 409
      * {@code IDEMPOTENCY_KEY_REUSED}). Сумма сравнивается по значению, а не по масштабу: 10 и 10.0000 одно и то же.
      */
@@ -215,5 +253,17 @@ public class Transfer implements Persistable<UUID> {
 
     public Instant getUpdatedAt() {
         return updatedAt;
+    }
+
+    public int getRetryAttempts() {
+        return retryAttempts;
+    }
+
+    public Instant getLastAttemptAt() {
+        return lastAttemptAt;
+    }
+
+    public Instant getRetryExhaustedAt() {
+        return retryExhaustedAt;
     }
 }

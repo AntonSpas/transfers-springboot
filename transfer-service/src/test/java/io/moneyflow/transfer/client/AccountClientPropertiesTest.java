@@ -2,6 +2,7 @@ package io.moneyflow.transfer.client;
 
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.boot.test.context.ConfigDataApplicationContextInitializer;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.context.annotation.Configuration;
 
@@ -50,10 +51,17 @@ class AccountClientPropertiesTest {
                     AccountClientProperties p = ctx.getBean(AccountClientProperties.class);
                     assertThat(p.url()).isEqualTo("http://localhost:8081");
                     assertThat(p.connectTimeout()).isEqualTo(Duration.ofSeconds(2));
-                    assertThat(p.readTimeout()).isEqualTo(Duration.ofSeconds(5));
+                    assertThat(p.readTimeout()).isEqualTo(Duration.ofSeconds(8));
                     assertThat(p.maxAttempts()).isEqualTo(3);
                     assertThat(p.retryBackoff()).isEqualTo(Duration.ofMillis(200));
                 });
+    }
+
+    @Test
+    void applicationYmlSetsTheReadTimeout() {
+        runner.withInitializer(new ConfigDataApplicationContextInitializer())
+                .run(ctx -> assertThat(ctx.getBean(AccountClientProperties.class).readTimeout())
+                        .isEqualTo(Duration.ofSeconds(8)));
     }
 
     @Test

@@ -20,7 +20,7 @@ class OutboxSchedulingTest {
 
     private final OutboxPublisher publisher = mock(OutboxPublisher.class);
     private final OutboxProperties properties =
-            new OutboxProperties(true, Duration.ofSeconds(2), 100, Duration.ofSeconds(5));
+            new OutboxProperties(true, Duration.ofSeconds(2), 100, Duration.ofSeconds(5), 10);
     private final OutboxScheduling scheduling = new OutboxScheduling(publisher, properties);
 
     @Test

@@ -19,8 +19,9 @@ public record ConsumerProperties(
 ) {
 
     /**
-     * Повторы при временных ошибках. Пауза растёт экспоненциально: {@code initialInterval}, затем
-     * {@code initialInterval * multiplier} и так далее, но не больше {@code maxInterval}.
+     * Повторы при ошибках обработки. Пауза растёт экспоненциально: {@code initialInterval}, затем
+     * {@code initialInterval * multiplier} и так далее, но не больше {@code maxInterval}. Значения по умолчанию
+     * дают окно около 3 минут (паузы 1, 2, 4, 8, 16 с и пять по 30 с, всего 181 с).
      *
      * @param attempts        число повторов после первой неудачи (всего попыток на одну больше); 0 значит «без повторов»
      * @param initialInterval пауза перед первым повтором
@@ -28,10 +29,10 @@ public record ConsumerProperties(
      * @param maxInterval     верхняя граница паузы
      */
     public record Retry(
-            @DefaultValue("3") int attempts,
+            @DefaultValue("10") int attempts,
             @DefaultValue("1s") Duration initialInterval,
             @DefaultValue("2") double multiplier,
-            @DefaultValue("10s") Duration maxInterval
+            @DefaultValue("30s") Duration maxInterval
     ) {
 
         /** Партиция стоит на время повторов, поэтому их число ограничено. */

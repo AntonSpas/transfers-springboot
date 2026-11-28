@@ -72,4 +72,49 @@ class OutboxEventTest {
         assertThat(OutboxEvent.create(UUID.randomUUID(), UUID.randomUUID(), "t".repeat(100), "{}", NOW).getType())
                 .hasSize(100);
     }
+
+    @Test
+    void failuresAreCountedUntilTheEventIsParked() {
+        OutboxEvent e = event();
+
+        assertThat(e.recordPublishFailure("first", 2, NOW.plusSeconds(1))).isFalse();
+        assertThat(e.getParkedAt()).isNull();
+        assertThat(e.recordPublishFailure("second", 2, NOW.plusSeconds(2))).isTrue();
+
+        assertThat(e.getAttempts()).isEqualTo(2);
+        assertThat(e.getLastError()).isEqualTo("second");
+        assertThat(e.getParkedAt()).isEqualTo(NOW.plusSeconds(2));
+        assertThat(e.getPublishedAt()).isNull();
+    }
+
+    @Test
+    void parkedOrPublishedEventDoesNotAcceptFailures() {
+        OutboxEvent parked = event();
+        parked.recordPublishFailure("x", 1, NOW);
+        OutboxEvent published = event();
+        published.markPublished(NOW);
+
+        assertThatThrownBy(() -> parked.recordPublishFailure("x", 1, NOW)).isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> published.recordPublishFailure("x", 1, NOW))
+                .isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    void longErrorIsCutToColumnLengthWithoutNulAndBrokenSurrogates() {
+        OutboxEvent e = event();
+
+        e.recordPublishFailure("\0" + "a".repeat(499) + "\uD83D\uDE00" + "tail", 5, NOW);
+
+        assertThat(e.getLastError()).isEqualTo("a".repeat(499));
+    }
+
+    @Test
+    void invalidFailureArgumentsAreRejected() {
+        assertThatThrownBy(() -> event().recordPublishFailure(null, 1, NOW))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> event().recordPublishFailure("x", 0, NOW))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> event().recordPublishFailure("x", 1, null))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
 }
